@@ -240,8 +240,12 @@ jobs:
           [ "$got" = "$SRC_SHA" ] || { echo "::error::pulled label $got != $SRC_SHA"; exit 1; }
       - name: Smoke test (amd64 + arm64)
         run: |
+          # run each platform by its own manifest digest: reusing the index digest for a second platform fails
+          # with "cannot overwrite digest" on Docker's containerd image store
+          raw=$(docker buildx imagetools inspect --raw "$REF@$DIGEST")
           for p in linux/amd64 linux/arm64; do
-            got=$(docker run --rm --platform "$p" --entrypoint python "$REF@$DIGEST" -c 'import rpot; print(rpot.VERSION)')
+            pd=$(printf '%s' "$raw" | python3 -c 'import json,sys; os_,arch=sys.argv[1].split("/"); print(next(m["digest"] for m in json.load(sys.stdin)["manifests"] if m.get("platform",{}).get("os")==os_ and m.get("platform",{}).get("architecture")==arch))' "$p")
+            got=$(docker run --rm --platform "$p" --entrypoint python "$REF@$pd" -c 'import rpot; print(rpot.VERSION)')
             echo "$p: rpot.VERSION=$got"
             [ "$got" = "$VERSION" ] || { echo "::error::$p reports VERSION $got"; exit 1; }
           done
