@@ -1,0 +1,20 @@
+{
+  "id": "ftp-backup-server",
+  "title": "FTP / Backup Server",
+  "description": "Linux backup box: vsftpd with nightly database and site backups, SSH for admins.",
+  "os": "Debian GNU/Linux 12 (bookworm)",
+  "default_name": "BKP01",
+  "services": [
+    {
+      "type": "ftp",
+      "port": 21,
+      "banner": "220 (vsFTPd 3.0.3)"
+    },
+    {
+      "type": "ssh",
+      "port": 22,
+      "banner": "SSH-2.0-OpenSSH_9.2p1 Debian-2+deb12u3"
+    }
+  ],
+  "order": 30
+}

@@ -1,0 +1,12 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ReD-Pot console</title><link rel="icon" href="/static/brand/favicon.svg"><link rel="stylesheet" href="/static/app.css"></head>
+<body><div class="login-wrap"><form class="login-box" method="post" action="/login">
+<img src="/static/brand/rpot-logo-dark.svg" alt="ReD-Pot by RedSide Security">
+<label class="muted" for="t">Console access token</label>
+<input id="t" name="token" type="password" autocomplete="current-password" autofocus>
+<div class="err" id="err"></div>
+<button class="btn red" type="submit">Sign in</button>
+<p class="muted" style="font-size:12px;margin:16px 0 0">The token was shown at the end of the install and is saved in <span class="mono">/opt/redpot/manager/INSTALL-INFO.txt</span>. Lost it? Run <span class="mono">sudo ./install.sh reset-token</span>.</p>
+</form></div>
+<script src="/static/login.js"></script></body></html>

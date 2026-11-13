@@ -1,0 +1,28 @@
+{
+  "id": "linux-web-hosting",
+  "title": "Linux Web Hosting",
+  "description": "Ubuntu web server: Apache + PHP intranet/admin portal, SSH for deploys.",
+  "os": "Ubuntu 22.04.5 LTS",
+  "default_name": "WEB01",
+  "services": [
+    {
+      "type": "ssh",
+      "port": 22,
+      "banner": "SSH-2.0-OpenSSH_8.9p1 Ubuntu-3ubuntu0.10"
+    },
+    {
+      "type": "http",
+      "port": 80,
+      "server": "Apache/2.4.52 (Ubuntu)",
+      "powered_by": "PHP/8.1.2-1ubuntu2.19"
+    },
+    {
+      "type": "http",
+      "port": 443,
+      "tls": true,
+      "server": "Apache/2.4.52 (Ubuntu)",
+      "powered_by": "PHP/8.1.2-1ubuntu2.19"
+    }
+  ],
+  "order": 20
+}

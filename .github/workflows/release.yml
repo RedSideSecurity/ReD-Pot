@@ -1,0 +1,284 @@
+# ReD-Pot release: on a version tag (vX.Y.Z), run the full CI, build the multi-arch image, push it to ghcr.io
+# with provenance + SBOM, verify the pushed image, then create the GitHub Release from CHANGELOG.md.
+#
+# The image is accepted by the installer (installer/redpot_install.py ensure_image) only when its label
+# io.redside.src-sha256 equals src_hash() of the user's checkout. SRC_SHA is therefore computed by importing the
+# installer and calling its own src_hash(): there is no second implementation here that could drift
+# (tests/test_release_workflow.py enforces this).
+#
+# Only the versioned tag is pushed, no :latest: the installer always pulls <image>:<VERSION> and verifies it, and a
+# moving :latest would invite unpinned, unverified pulls.
+# Third-party actions are pinned to full commit SHAs; the version is noted next to each pin.
+name: Release
+
+on:
+  push:
+    tags: ["v*.*.*"]
+
+permissions: {}
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  PYTHONDONTWRITEBYTECODE: "1"
+
+jobs:
+  ci:
+    name: CI (full suite)
+    uses: ./.github/workflows/ci.yml
+    with:
+      full: true
+    permissions:
+      contents: read
+
+  meta:
+    name: version, image ref, SRC_SHA, notes
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      image: ${{ steps.meta.outputs.image }}
+      ref: ${{ steps.meta.outputs.ref }}
+      src_sha: ${{ steps.meta.outputs.src_sha }}
+      prerelease: ${{ steps.meta.outputs.prerelease }}
+      notes: ${{ steps.notes.outputs.notes }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0            # the tag must be on main (ancestry check)
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.13"
+      - name: Tag commit is on main
+        run: |
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main \
+            || { echo "::error::tag $GITHUB_REF_NAME ($GITHUB_SHA) is not on main"; exit 1; }
+      - name: Version, image ref and SRC_SHA (from the installer itself)
+        id: meta
+        env:
+          TAG: ${{ github.ref_name }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          python3 -I - <<'PY'
+          import os, re, sys
+          sys.path.insert(0, os.path.join(os.environ["GITHUB_WORKSPACE"], "installer"))
+          import redpot_install as inst                      # the installer must not need the rpot package
+          assert "rpot" not in sys.modules, "installer imported rpot"
+
+          def fail(msg):
+              print(f"::error::{msg}")
+              sys.exit(1)
+
+          tag, version = os.environ["TAG"], inst.VERSION    # VERSION is read from rpot/__init__.py
+          if tag != "v" + version:
+              fail(f"tag {tag} does not match rpot/__init__.py VERSION {version} (expected v{version})")
+          if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?", version):
+              fail(f"VERSION {version} is not semver")
+          ref = inst.REGISTRY_IMAGE                         # exactly what the installer pulls
+          image, _, ref_tag = ref.rpartition(":")
+          owner = os.environ["OWNER"].lower()
+          if ref_tag != version or image != image.lower() or not image.startswith(f"ghcr.io/{owner}/"):
+              fail(f"REGISTRY_IMAGE {ref} is not ghcr.io/{owner}/<name>:{version} (lowercase)")
+          src_sha = inst.src_hash()
+          if not re.fullmatch(r"[0-9a-f]{64}", src_sha):
+              fail("src_hash() did not return a sha256 hex digest")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+              out.write(f"version={version}\nimage={image}\nref={ref}\nsrc_sha={src_sha}\n")
+              out.write(f"prerelease={'true' if '-' in version else 'false'}\n")
+          print(f"version={version}\nref={ref}\nsrc_sha={src_sha}")
+          PY
+      - name: Release notes from CHANGELOG.md
+        id: notes
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          python3 -I - <<'PY'
+          import os, re, secrets, sys
+          version = os.environ["VERSION"]
+          text = open("CHANGELOG.md", encoding="utf-8").read()
+          m = re.search(rf"^## {re.escape(version)}\b[^\n]*\n(.*?)(?=^## |\Z)", text, re.M | re.S)
+          if not m or not m.group(1).strip():
+              print(f"::error::CHANGELOG.md has no '## {version}' section")
+              sys.exit(1)
+          delim = "EOF_" + secrets.token_hex(16)
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+              out.write(f"notes<<{delim}\n{m.group(1).strip()}\n{delim}\n")
+          PY
+
+  build:
+    name: build + push multi-arch image
+    needs: [ci, meta]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    environment: release            # add required reviewers to this environment in the repo settings
+    permissions:
+      contents: read
+      packages: write               # push to ghcr.io with GITHUB_TOKEN
+      id-token: write               # Sigstore signing of the provenance attestation
+      attestations: write
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.13"
+      - name: Build context hashes to SRC_SHA
+        env:
+          SRC_SHA: ${{ needs.meta.outputs.src_sha }}
+        run: |
+          python3 -I - <<'PY'
+          import os, sys
+          sys.path.insert(0, os.path.join(os.environ["GITHUB_WORKSPACE"], "installer"))
+          import redpot_install as inst
+          got = inst.src_hash()
+          if got != os.environ["SRC_SHA"]:
+              print(f"::error::build checkout hashes to {got}, meta computed {os.environ['SRC_SHA']}")
+              sys.exit(1)
+          PY
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+        with:
+          platforms: arm64
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .                # the checkout hashed above, not the remote git context
+          file: Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          pull: true
+          no-cache: true
+          tags: ${{ needs.meta.outputs.ref }}
+          build-args: |
+            SRC_SHA=${{ needs.meta.outputs.src_sha }}
+            VERSION=${{ needs.meta.outputs.version }}
+          provenance: mode=max
+          sbom: true
+      - name: Provenance attestation (GitHub / Sigstore)
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ needs.meta.outputs.image }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+  verify:
+    name: verify pushed image
+    needs: [meta, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: read
+      attestations: read
+    env:
+      REF: ${{ needs.meta.outputs.ref }}
+      IMAGE: ${{ needs.meta.outputs.image }}
+      DIGEST: ${{ needs.build.outputs.digest }}
+      SRC_SHA: ${{ needs.meta.outputs.src_sha }}
+      VERSION: ${{ needs.meta.outputs.version }}
+    steps:
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+        with:
+          platforms: arm64
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Tag points at the built digest
+        run: |
+          got=$(docker buildx imagetools inspect "$REF" --format '{{json .Manifest}}' \
+                | python3 -c 'import json,sys; print(json.load(sys.stdin)["digest"])')
+          echo "$REF -> $got (built $DIGEST)"
+          [ "$got" = "$DIGEST" ] || { echo "::error::$REF does not point at the built digest"; exit 1; }
+      - name: Label on every platform equals SRC_SHA
+        run: |
+          docker buildx imagetools inspect "$REF" --format '{{json .Image}}' > image-config.json
+          python3 -I - <<'PY'
+          import json, os, sys
+          cfg = json.load(open("image-config.json"))
+          want, version = os.environ["SRC_SHA"], os.environ["VERSION"]
+          need = {"linux/amd64", "linux/arm64"}
+          if "config" in cfg:                               # single-platform image: not what we pushed
+              cfg = {"single": cfg}
+          seen, bad = set(), []
+          for plat, img in cfg.items():
+              if plat.startswith("unknown"):                # attestation manifests, not runnable images
+                  continue
+              labels = (img.get("config") or {}).get("Labels") or {}
+              seen.add(plat)
+              if labels.get("io.redside.src-sha256") != want:
+                  bad.append(f"{plat}: io.redside.src-sha256={labels.get('io.redside.src-sha256')}")
+              if labels.get("org.opencontainers.image.version") != version:
+                  bad.append(f"{plat}: version label={labels.get('org.opencontainers.image.version')}")
+          if need - seen:
+              bad.append(f"missing platforms: {sorted(need - seen)}")
+          print("platforms:", sorted(seen))
+          if bad:
+              print("::error::" + "; ".join(bad))
+              sys.exit(1)
+          PY
+      - name: Installer check (docker pull + label, as ensure_image does)
+        run: |
+          docker pull -q "$REF"
+          got=$(docker image inspect -f '{{index .Config.Labels "io.redside.src-sha256"}}' "$REF")
+          [ "$got" = "$SRC_SHA" ] || { echo "::error::pulled label $got != $SRC_SHA"; exit 1; }
+      - name: Smoke test (amd64 + arm64)
+        run: |
+          for p in linux/amd64 linux/arm64; do
+            got=$(docker run --rm --platform "$p" --entrypoint python "$REF@$DIGEST" -c 'import rpot; print(rpot.VERSION)')
+            echo "$p: rpot.VERSION=$got"
+            [ "$got" = "$VERSION" ] || { echo "::error::$p reports VERSION $got"; exit 1; }
+          done
+      - name: Provenance attestation verifies
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh attestation verify "oci://$REF" --repo "$GITHUB_REPOSITORY"
+
+  release:
+    name: GitHub Release
+    needs: [meta, build, verify]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ github.ref_name }}
+      VERSION: ${{ needs.meta.outputs.version }}
+      REF: ${{ needs.meta.outputs.ref }}
+      IMAGE: ${{ needs.meta.outputs.image }}
+      DIGEST: ${{ needs.build.outputs.digest }}
+      SRC_SHA: ${{ needs.meta.outputs.src_sha }}
+      NOTES: ${{ needs.meta.outputs.notes }}
+      PRERELEASE: ${{ needs.meta.outputs.prerelease }}
+    steps:
+      - name: Create release
+        run: |
+          {
+            printf '%s\n\n' "$NOTES"
+            printf '### Container image\n\n'
+            printf '`%s` (linux/amd64, linux/arm64)\n\n' "$REF"
+            printf -- '- digest: `%s`\n' "$DIGEST"
+            printf -- '- source hash label `io.redside.src-sha256`: `%s`\n' "$SRC_SHA"
+            printf -- '- provenance: `gh attestation verify oci://%s --repo %s`\n' "$REF" "$GITHUB_REPOSITORY"
+          } > release-notes.md
+          extra=()
+          [ "$PRERELEASE" = "true" ] && extra+=(--prerelease)
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag \
+            --title "ReD-Pot $VERSION" --notes-file release-notes.md "${extra[@]}"

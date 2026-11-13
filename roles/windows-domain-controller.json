@@ -1,0 +1,24 @@
+{
+  "id": "windows-domain-controller",
+  "title": "Windows Domain Controller",
+  "description": "Active Directory domain controller: Microsoft DNS, Kerberos, LDAP/LDAPS/Global Catalog, CLDAP, NetBIOS name service, NTP, SYSVOL + NETLOGON shares, RDP.",
+  "os": "Windows Server 2019 Standard 17763",
+  "default_name": "DC01",
+  "services": [
+    {"type": "dns", "port": 53},
+    {"type": "kerberos", "port": 88},
+    {"type": "ntp", "port": 123, "udp": true},
+    {"type": "msrpc", "port": 135},
+    {"type": "nbns", "port": 137, "udp": true},
+    {"type": "netbios", "port": 139},
+    {"type": "ldap", "port": 389},
+    {"type": "cldap", "port": 389, "udp": true},
+    {"type": "smb", "port": 445, "shares": ["SYSVOL", "NETLOGON"]},
+    {"type": "kerberos", "port": 464},
+    {"type": "ldap", "port": 636, "tls": true},
+    {"type": "ldap", "port": 3268},
+    {"type": "ldap", "port": 3269, "tls": true},
+    {"type": "rdp", "port": 3389}
+  ],
+  "order": 40
+}

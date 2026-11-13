@@ -1,0 +1,6 @@
+.git
+docs
+tests
+tools
+**/__pycache__
+*.pyc

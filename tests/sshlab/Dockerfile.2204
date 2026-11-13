@@ -1,0 +1,3 @@
+FROM ubuntu:22.04
+RUN apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq systemd systemd-sysv openssh-server python3 iproute2 psmisc >/dev/null && rm -f /etc/ssh/sshd_not_to_be_run
+CMD ["/sbin/init"]

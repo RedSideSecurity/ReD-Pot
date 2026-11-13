@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+/lab/
+/deploy/*/
+*.db
+*.db-*
+rpot.json
+!roles/*.json

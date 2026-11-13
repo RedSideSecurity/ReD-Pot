@@ -1,0 +1,32 @@
+{
+  "id": "windows-file-server",
+  "title": "Windows File Server",
+  "description": "Windows Server file server with departmental SMB shares and RDP for admins.",
+  "os": "Windows Server 2019 Standard 17763",
+  "default_name": "FS01",
+  "services": [
+    {
+      "type": "msrpc",
+      "port": 135
+    },
+    {
+      "type": "netbios",
+      "port": 139
+    },
+    {
+      "type": "smb",
+      "port": 445,
+      "shares": [
+        "Finance",
+        "HR",
+        "IT",
+        "Public"
+      ]
+    },
+    {
+      "type": "rdp",
+      "port": 3389
+    }
+  ],
+  "order": 10
+}

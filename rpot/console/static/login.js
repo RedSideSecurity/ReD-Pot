@@ -1,0 +1,1 @@
+var q=location.search;if(q.indexOf("bad=1")>=0){document.getElementById("err").textContent="Invalid token."}if(q.indexOf("locked=1")>=0){document.getElementById("err").textContent="Too many failed attempts — try again in 10 minutes."}

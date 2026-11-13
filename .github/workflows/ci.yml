@@ -1,0 +1,122 @@
+# ReD-Pot CI: unit tests, CE gate, repo hygiene and dependency audit.
+# Runs on push/PR to main, nightly (full suite incl. slow tests), on demand, and is called by release.yml
+# (full suite) before anything is built or published.
+# Third-party actions are pinned to full commit SHAs; the version is noted next to each pin.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "17 3 * * *"          # nightly: full suite, slow tests included
+  workflow_dispatch:
+    inputs:
+      full:
+        description: "Run the full suite (slow tests included)"
+        type: boolean
+        default: false
+  workflow_call:
+    inputs:
+      full:
+        description: "Run the full suite (slow tests included)"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  PYTEST_VERSION: "9.2.0"
+  RERUN_VERSION: "16.7"   # pytest-rerunfailures: retry known load-sensitive socket tests (tracked in RC-20)
+  PIP_AUDIT_VERSION: "2.10.1"
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  PYTHONDONTWRITEBYTECODE: "1"
+
+jobs:
+  tests:
+    name: pytest (Python ${{ matrix.python }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install dependencies
+        run: |
+          python -m pip install -r requirements.txt "pytest==${PYTEST_VERSION}" "pytest-rerunfailures==${RERUN_VERSION}"
+      - name: Compile check
+        run: python -m compileall -q rpot installer roles rpotctl.py
+      - name: CE removed-features gate
+        run: python -m pytest -q -p no:cacheprovider tests/test_ce_gate.py
+      - name: Test suite
+        env:
+          FULL: ${{ github.event_name == 'schedule' || inputs.full == true }}
+        # As root (passwordless sudo on the ephemeral runner): ReD-Pot runs as root on the host, and the entrypoint
+        # privilege-drop and SMB IPC empty-dir tests need root (they fail as an unprivileged uid).
+        run: |
+          marker=()
+          if [ "$FULL" = "true" ]; then
+            echo "Full suite (slow tests included)"
+          else
+            echo "Quick suite (-m 'not slow'); the full suite runs nightly and on release tags"
+            marker=(-m "not slow")
+          fi
+          sudo -E env "PATH=$PATH" python -m pytest -q -p no:cacheprovider --reruns 2 --reruns-delay 2 "${marker[@]}"
+
+  hygiene:
+    name: repo hygiene
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0            # whole history for the attribution check
+      - name: No AI attribution in commits or files
+        run: |
+          # The pattern is written with character classes so this file does not match itself.
+          pat='cl[a]ude|anthr[o]pic'
+          bad=0
+          if git log --format='%H %an <%ae> / %cn <%ce>%n%B' HEAD | grep -inE "$pat"; then
+            echo "::error::commit author/committer/message credits an AI assistant"; bad=1
+          fi
+          if git ls-files -z | xargs -0 grep -nIiE "$pat" --; then
+            echo "::error::a tracked file credits an AI assistant"; bad=1
+          fi
+          exit "$bad"
+      - name: Shell syntax (bash -n)
+        run: |
+          rc=0
+          while IFS= read -r -d '' f; do
+            bash -n "$f" || { echo "::error file=$f::bash -n failed"; rc=1; }
+          done < <(git ls-files -z '*.sh')
+          exit "$rc"
+
+  deps-audit:
+    name: dependency audit (pip-audit)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.13"
+      - name: pip-audit requirements.txt
+        run: |
+          python -m pip install "pip-audit==${PIP_AUDIT_VERSION}"
+          pip-audit --strict --progress-spinner off -r requirements.txt

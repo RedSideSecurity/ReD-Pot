@@ -1,0 +1,12 @@
+{
+  "id": "linux-dns-server",
+  "title": "Linux DNS Server",
+  "description": "BIND 9 authoritative DNS for the company zone (A/SRV records of the other decoys), SSH for admins.",
+  "os": "Ubuntu 22.04.4 LTS",
+  "default_name": "DNS01",
+  "services": [
+    {"type": "ssh", "port": 22},
+    {"type": "dns", "port": 53}
+  ],
+  "order": 50
+}

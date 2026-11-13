@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ReD-Pot console</title><link rel="icon" href="/static/brand/favicon.svg"><link rel="stylesheet" href="/static/app.css"></head>
+<body>
+<header class="top">
+  <img class="logo" src="/static/brand/rpot-logo-dark.svg" alt="ReD-Pot by RedSide Security">
+  <span class="edition" id="edition" hidden></span>
+  <nav class="tabs" id="tabs">
+    <button data-v="overview" class="on">Overview</button>
+    <button data-v="worldmap">Attack map</button>
+    <button data-v="incidents">Incidents</button>
+    <button data-v="hosts">Hosts</button>
+    <button data-v="events">Events</button>
+    <button data-v="deception">Deception</button>
+  </nav>
+  <div class="right">
+    <span id="company"></span>
+    <select id="range" title="Time range">
+      <option value="0.25">Last 15 min (live)</option><option value="1">Last hour</option><option value="24" selected>Last 24 h</option>
+      <option value="168">Last 7 days</option><option value="720">Last 30 days</option>
+    </select>
+    <span class="live" id="live"><i></i><span>live</span></span>
+    <a class="btn" href="/wall" target="_blank" rel="noopener" title="Open the full-screen attack map for big screens in a new tab">⛶ Wall</a>
+    <form method="post" action="/logout" style="margin:0"><button class="btn" type="submit">Sign out</button></form>
+  </div>
+</header>
+<div class="wallbar" id="wallbar">
+  <img class="logo" src="/static/brand/rpot-logo-dark.svg" alt="ReD-Pot">
+  <div class="wtitle"><b>LIVE ATTACK MAP</b><span id="wco"></span></div>
+  <div class="wk" id="wkpis"></div>
+  <div class="wclock"><b id="wtime">--:--:--</b><span id="wdate"></span></div>
+  <span class="live" id="wlive"><i></i><span>LIVE</span></span>
+</div>
+<main>
+  <div class="offline-banner" id="offline" hidden></div>
+  <div class="offline-banner" id="jserr" hidden></div>
+  <div class="offline-banner warn" id="clockwarn" hidden></div>
+  <div class="offline-banner boot" id="bootfail"><b>⚠ The console did not start</b> — a script failed to load (network
+    error, proxy or browser extension). Reload the page (Ctrl+F5); if this stays, check the manager log.</div>
+  <section class="view on" id="v-overview">
+    <div class="kpis" id="kpis"></div>
+    <div class="grid">
+      <div class="card">
+        <div class="hd"><h3>Internal network map</h3>
+          <div class="legend" id="legend"></div>
+          <div class="sp">
+            <select id="gmin" title="Minimum severity shown">
+              <option value="1">All touches (L1+)</option><option value="2">Interaction (L2+)</option>
+              <option value="3" selected>Real incidents (L3+)</option><option value="4">Compromise (L4+)</option>
+            </select>
+            <select id="gscope" title="Which sources"><option value="internal" selected>Internal sources</option><option value="all">+ external (Internet)</option></select>
+            <button class="btn" id="gfit" title="Fit graph">Fit</button>
+          </div>
+        </div>
+        <div id="graph"></div>
+      </div>
+      <div class="card">
+        <div class="hd"><h3>Live incidents</h3><div class="sp"><span class="muted" id="inccount"></span></div></div>
+        <div class="feed" id="feed"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="view" id="v-worldmap">
+    <div class="grid">
+      <div class="wleft">
+      <div class="card">
+        <div class="hd"><h3>World attack map · public IPs</h3><div class="wstats" id="wstats"></div>
+          <div class="sp"><a class="btn" id="wallbtn" href="/wall" target="_blank" rel="noopener" title="Open the full-screen wall display in a new tab">⛶ Wall mode</a>
+            <select id="wmin" title="Minimum severity shown">
+            <option value="1" selected>All (L1+)</option><option value="2">Interaction (L2+)</option>
+            <option value="3">Intent (L3+)</option><option value="4">Compromise (L4+)</option></select></div></div>
+        <div class="wwrap"><canvas id="wmap"></canvas><div id="wtip" class="wtip"></div></div>
+        <div class="legend" style="padding:8px 14px">
+          <span><i style="background:#6f6f78"></i>touch</span><span><i style="background:#e3b341"></i>interaction</span>
+          <span><i style="background:#ff8a1f"></i>intent</span><span><i style="background:#f12c35"></i>compromise</span>
+          <span><i style="background:#d63bff"></i>honeytoken</span>
+          <span class="recency"><b></b>bright = recent · fades with age · pulse = last hour</span></div>
+        <div class="wsites" id="wsites"></div>
+        <div class="muted" id="wattr" style="padding:0 14px 10px;font-size:12px"></div>
+      </div>
+      <div class="card"><div class="hd"><h3>Live external activity</h3><div class="sp"><span class="muted" id="wfeedinfo"></span></div></div><div class="wlist feedx" id="wfeed"></div></div>
+      </div>
+      <div class="wside">
+        <div class="card"><div class="hd"><h3>Top countries</h3></div><div class="bd wlist" id="wcountries"></div></div>
+        <div class="card"><div class="hd"><h3>Top networks (ASN)</h3></div><div class="bd wlist" id="worgs"></div></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="view" id="v-incidents">
+    <div class="toolbar">
+      <select id="imin"><option value="1">All levels</option><option value="3" selected>L3+ real incidents</option><option value="4">L4+ compromise</option><option value="5">L5 honeytoken</option></select>
+      <select id="istatus"><option value="">Any status</option><option value="open" selected>Open</option><option value="ack">Acknowledged</option><option value="closed">Closed</option><option value="false_positive">False positive</option></select>
+      <div class="xport" id="xport">
+        <label for="xfrom">From</label><input type="date" id="xfrom" required>
+        <label for="xto">To</label><input type="date" id="xto" required>
+        <span class="muted" title="Dates are whole UTC days; To is included">UTC</span>
+        <button class="btn" id="xbtn" type="button" title="Download incidents and alert records in this date range as JSON">Export JSON</button>
+      </div>
+    </div>
+    <div class="err xerr" id="xerr" role="alert"></div>
+    <div class="card tablewrap"><table id="t-inc"></table></div>
+  </section>
+
+  <section class="view" id="v-hosts"><div class="card tablewrap"><table id="t-hosts"></table></div></section>
+
+  <section class="view" id="v-events">
+    <div class="toolbar">
+      <select id="emin"><option value="0">All events</option><option value="2">L2+</option><option value="3" selected>L3+</option><option value="4">L4+</option></select>
+      <input type="text" id="esrc" placeholder="Filter source IP">
+    </div>
+    <div class="card tablewrap"><table id="t-ev"></table></div>
+  </section>
+
+  <section class="view" id="v-deception">
+    <p class="muted" style="margin-top:0">Your decoy servers and the baits planted on them. Nobody has a reason to touch any of this,
+      so every hit is meaningful. A used bait raises an <b>L5 honeytoken</b> incident that names where it was stolen from.</p>
+    <div class="sgrid" id="sgrid"></div>
+    <div class="card" style="margin-top:16px"><div class="hd"><h3>Add a sensor (another server)</h3>
+      <div class="sp"><span class="slots" id="fslots"></span><span class="muted">one-time join command, valid 24 h</span></div></div>
+      <div class="bd">
+        <div class="toolbar">
+          <input type="text" id="fname" placeholder="Host name, e.g. ARB-FS-03" maxlength="15">
+          <select id="frole"></select>
+          <input type="text" id="fip" placeholder="Decoy IP (optional)">
+          <button class="btn red" id="fadd">Create join command</button>
+          <span class="err" id="ferr" role="alert"></span>
+        </div>
+        <div class="limitmsg" id="ffull" role="status" hidden></div>
+        <div id="fjoin" class="collapsed">
+          <p class="muted" style="margin:4px 0">1. Run this on the new server (it installs Docker if needed, enrolls, and starts the decoy):</p>
+          <pre class="mono joincmd" id="fcmd"></pre>
+          <button class="btn" id="fcopy">Copy</button>
+          <p class="muted" style="margin:10px 0 4px">2. Join string (one-time, valid 24 h):</p>
+          <pre class="mono joincmd" id="fjoinstr"></pre>
+          <button class="btn" id="fcopyjoin">Copy</button>
+          <p class="muted" id="fjoinhint" style="margin:6px 0 0">Paste it when the installer asks; or use --join-file / --join - for unattended installs. Never put it on the command line: other users of that server could read it.</p>
+        </div>
+        <div id="fleet" style="margin-top:12px"></div>
+      </div></div>
+    <div class="card" style="margin-top:16px"><div class="hd"><h3>All baits</h3><div class="sp"><span class="muted" id="baitsum"></span></div></div>
+      <div class="tablewrap"><table id="t-baits"></table></div></div>
+  </section>
+</main>
+
+<aside class="drawer" id="drawer"><div class="dh"><div id="dtitle"></div><button class="x" id="dclose" aria-label="Close">&times;</button></div><div class="db" id="dbody"></div></aside>
+<script src="/static/vendor/vis-network.min.js"></script>
+<script src="/static/vendor/topojson-client.min.js"></script>
+<script src="/static/icons.js"></script>
+<script src="/static/netmap.js"></script>
+<script src="/static/app.js"></script>
+<script src="/static/worldmap.js"></script>
+<script src="/static/wall.js"></script>
+</body></html>
