@@ -8,8 +8,11 @@ LABEL org.opencontainers.image.title="ReD-Pot" \
       org.opencontainers.image.licenses="MIT" \
       org.opencontainers.image.vendor="RedSide Security" \
       org.opencontainers.image.version="${VERSION}" \
-      io.redside.src-sha256="${SRC_SHA}"
-ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+      io.redside.src-sha256="${SRC_SHA}" \
+      io.redside.edition="community"
+# B8 (1.0.1): SQLite temp files (big sorts, e.g. a 24 h GROUP BY, ~19 MB at 350k events) go to the data volume, not
+# the 16 MB /tmp tmpfs ("database or disk is full"). Read once when the process starts; the console creates the dir.
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 SQLITE_TMPDIR=/var/lib/rpot/tmp
 WORKDIR /opt/rpot
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt

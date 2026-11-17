@@ -281,6 +281,9 @@ class TestAdminAllowlistsH2(unittest.TestCase):
         self.assertIn("admin access: web UI from 10.99.0.7/32 · sensor API from 10.99.0.7/32 · SSH from 10.99.0.7/32", out)
         self.assertNotIn("another address", out)
         self.assertNotIn("free address", out)
+        # B1 (RC-35): restricted web UI allow-list → plain warning that bait documents report only from allowed hosts
+        self.assertIn("Bait Word documents call home to this web UI port", out)
+        self.assertIn("! Bait documents only report from addresses allowed to reach the console", out)
 
     @pytest.mark.slow
     def test_yes_requires_explicit_allowlists(self):
@@ -300,12 +303,14 @@ class TestAdminAllowlistsH2(unittest.TestCase):
                          "--allow-ssh", "10.8.0.0/24")
         self.assertEqual(rc, 0, out[-1500:])
         self.assertIn("-i ens3 -p tcp -m conntrack --ctorigdst 203.0.113.20 --ctorigdstport", out)
+        self.assertIn("! Bait documents only report from addresses allowed to reach the console", out)   # B1, --yes
 
     def test_decoy_elsewhere_keeps_open_defaults(self):
         rc, out, _ = run([], THREE, "--yes", "--domain", "x.example.com", "--roles", "windows-file-server",
                          "--role-ifaces", "windows-file-server=eth1", "--public-ip", "no", "--geoip", "no", "ask-allow")
         self.assertEqual(rc, 0, out[-1500:])
         self.assertIn("web UI from 0.0.0.0/0 · sensor API from 0.0.0.0/0", out)
+        self.assertNotIn("Bait documents only report from", out)          # B1: open web UI → no warning
 
     def test_allowlist_questions_and_firewall(self):
         rc, out, _ = run(["1", "x.example.com", "1", "4", "1", "DC01",       # DC shares 10.0.0.5
@@ -407,8 +412,15 @@ class TestSensorWizard(unittest.TestCase):
 
     def test_sensor_one_nic_moves_ssh_and_follows_dhcp(self):
         one_dhcp = [dict(ONE[0], dynamic=True)]
-        rc, out, _ = run([JOIN, "", ""], one_dhcp, mode="sensor")  # SSH allow-list (B5: default = own client), review
+        rc, out, _ = run([JOIN, "", "", "y"], one_dhcp, mode="sensor")  # SSH allow-list (default = own client), review, DHCP
         self.assertEqual(rc, 0, out[-1500:])
+        # RC-35 B5: the decoy follows the lease, the manager's sensor-API allow-list does not → warn, confirm (default n)
+        self.assertIn("203.0.113.20 (ens3) is a DHCP lease, not a static address — used for: manager link (the "
+                      "manager's sensor-API allow-list may name only this address)", out)
+        self.assertIn("A remote sensor needs a static address or a DHCP reservation", out)
+        self.assertIn("sudo ./install.sh set-access --allow-sensor", out)
+        self.assertIn("Continue with DHCP addresses anyway? (y/n) [n]", out)
+        self.assertNotIn("these stop answering", out)
         self.assertIn("Host SSH may be used from [10.99.0.7/32]", out)
         self.assertIn("host SSH moves to port", out)
         self.assertRegex(out, r"host SSH moves to port \d+ · from 10\.99\.0\.7/32")
@@ -420,7 +432,6 @@ class TestSensorWizard(unittest.TestCase):
         self.assertIn('RPOT_SENSOR_IFACE: "ens3"', out)
         self.assertNotIn("RPOT_BIND_IP", out)
         self.assertNotIn("would pin host SSH", out)
-        self.assertNotIn("DHCP lease", out)                         # the decoy follows the lease (S-1 L14)
         self._no_extra_addresses(out)
 
     @pytest.mark.slow
@@ -464,7 +475,10 @@ class TestSensorWizard(unittest.TestCase):
         dyn = [dict(THREE[0], dynamic=True), dict(THREE[1], dynamic=True)]
         rc, out, _ = run([JOIN, "", "", "", "y"], dyn, mode="sensor")
         self.assertEqual(rc, 0, out[-1500:])
-        self.assertIn("10.0.0.5 (eth0) is a DHCP lease, not a static address — used for: manager link, host SSH", out)
+        self.assertIn("10.0.0.5 (eth0) is a DHCP lease, not a static address — used for: manager link, host SSH (the "
+                      "manager's sensor-API allow-list may name only this address)", out)
+        self.assertIn("A remote sensor needs a static address or a DHCP reservation", out)
+        self.assertIn("these stop answering and host SSH may be unreachable", out)
         self.assertIn("192.168.50.10 (eth1) is a DHCP lease, not a static address — used for: decoy", out)
 
 
@@ -685,6 +699,10 @@ class TestUnattendedValidation(unittest.TestCase):
                                     "FS01=windows-file-server"], capture_output=True, text=True, env=e, timeout=120)
                 self.assertEqual(p.returncode, 0, p.stderr[-800:])
                 self.assertEqual("next     : rpotctl.py compose" in p.stdout, not quiet)
+                with open(os.path.join(d, "rpot.json")) as f:
+                    tok = json.load(f)["console"]["admin_token"]
+                # B3 (RC-35): under the installer the token is printed only in the final summary
+                self.assertEqual(tok in p.stdout, not quiet)
 
 
 def _rules(txt, chain, cmd="$IPT"):
@@ -1060,7 +1078,7 @@ class TestFirewall(unittest.TestCase):
         from unittest import mock
         calls = []
 
-        def fake_run(cmd, check=True, capture=False, quiet=False):
+        def fake_run(cmd, check=True, capture=False, quiet=False, new_session=False):
             calls.append(cmd[-1])
             return subprocess.CompletedProcess(cmd, 1 if cmd[-1] == "apply" else 0, "",
                                                "ReD-Pot firewall NOT in effect: FORWARD->REDPOT-DOCKER\x1b[2J")
@@ -1713,7 +1731,7 @@ class TestUninstallDryRun(unittest.TestCase):
 
 
 def run_add(inputs, ifaces, *args, mode="add-decoy", existing=None, state=None, busy=None, install=True, slots=None,
-            cfg_extra=None, no_state=False):
+            cfg_extra=None, no_state=False, compose="services: {}\n"):
     """add-decoy / remove-decoy against a fake existing CE manager install (dry-run: nothing is changed).
     slots: RPOT_TEST_SLOTS (the console's `rpotctl slots` answer); default = only the local decoys."""
     existing = existing if existing is not None else [
@@ -1724,7 +1742,7 @@ def run_add(inputs, ifaces, *args, mode="add-decoy", existing=None, state=None, 
                    "network": {"mode": "host"}, "sensors": existing, "tokens": {}}
             cfg.update(cfg_extra or {})
             json.dump(cfg, open(os.path.join(d, "rpot.json"), "w"))
-            open(os.path.join(d, "docker-compose.yml"), "w").write("services: {}\n")
+            open(os.path.join(d, "docker-compose.yml"), "w").write(compose)
             if not no_state:
                 json.dump(state or {"mgmt": "eth0", "mgmt_ip": "10.0.0.5", "ports": {"ui": 50000, "sensor": 50001, "ssh": 50022},
                                     "move_ssh": True, "pin_ssh": False, "public_ip": None,
@@ -1949,3 +1967,900 @@ class TestRpotctlAddSensor(unittest.TestCase):
             c("add-sensor", "-d", d, "--sensor", "WEB01=linux-web-hosting@10.0.5.60%eth2")
             self.assertEqual(open(os.path.join(d, "docker-compose.yml")).read(), before)
             self.assertFalse(os.path.isdir(os.path.join(d, "sensors", "DC01")))
+
+
+class TestSetAccess(unittest.TestCase):
+    """RC-35 B5: change the admin allow-lists after the install (a remote sensor on DHCP got a new address)
+    without reinstalling. Dry-run against a fake install: nothing is written (run_add checks the directory)."""
+
+    def test_unattended_changes_only_the_named_list(self):
+        rc, out = run_add([], TWO, "--yes", "--allow-sensor", "192.168.1.0/24", mode="set-access")
+        self.assertEqual(rc, 0, out[-2000:])
+        self.assertIn("Now: web UI from 0.0.0.0/0 · sensor API from 0.0.0.0/0 · SSH from 0.0.0.0/0", out)
+        self.assertIn("Sensor API  0.0.0.0/0  →  192.168.1.0/24", out)
+        self.assertNotIn("Web UI      0.0.0.0/0  →", out)
+        self.assertIn("--ctorigdst 10.0.0.5 --ctorigdstport 50001 -s 192.168.1.0/24 -j RETURN", out)
+        self.assertIn("would install /etc/systemd/system/redpot.service", out)
+        self.assertIn("web UI from 0.0.0.0/0 · sensor API from 192.168.1.0/24 · SSH from 0.0.0.0/0", out)
+        self.assertNotIn("ctl init", out)                          # persona + baits are NOT regenerated
+        self.assertNotIn("add-sensor", out)
+
+    def test_ssh_list_never_locks_out_the_current_session(self):
+        rc, out = run_add([], TWO, "--yes", "--allow-ssh", "10.8.0.0/24", mode="set-access")
+        self.assertEqual(rc, 0, out[-2000:])
+        self.assertIn("--dport 50022 -s 10.8.0.0/24 -j RETURN", out)
+        self.assertIn("--dport 50022 -s 10.99.0.7/32 -j RETURN", out)   # this SSH session's client
+        self.assertIn("-m conntrack --ctstate ESTABLISHED,RELATED -j RETURN", out)
+        self.assertIn("Your current SSH client 10.99.0.7 stays allowed and this session stays open", out)
+
+    def test_unchanged_is_a_no_op(self):
+        rc, out = run_add([], TWO, "--yes", "--allow-ui", "0.0.0.0/0", mode="set-access")
+        self.assertEqual(rc, 0, out[-2000:])
+        self.assertIn("Admin access unchanged — nothing to do.", out)
+        self.assertNotIn("would write", out)
+        self.assertNotIn("redpot.service", out)
+
+    def test_yes_needs_a_list(self):
+        rc, out = run_add([], TWO, "--yes", mode="set-access")
+        self.assertNotEqual(rc, 0)
+        self.assertIn("name the lists to change: sudo ./install.sh set-access --yes --allow-sensor", out)
+
+    def test_interactive_defaults_and_warnings(self):
+        state = {"mgmt": "eth0", "mgmt_ip": "10.0.0.5", "ports": {"ui": 50000, "sensor": 50001, "ssh": 50022},
+                 "move_ssh": True, "pin_ssh": False, "public_ip": None,
+                 "allow": {"ui": ["10.99.0.7/32"], "sensor": ["192.168.1.125/32"], "ssh": ["10.99.0.7/32"]}}
+        # web UI: keep (Enter) · sensor API: the sensor's new subnet · SSH: keep · apply: Enter (yes)
+        rc, out = run_add(["", "192.168.1.0/24", "", ""], TWO, mode="set-access", state=state)
+        self.assertEqual(rc, 0, out[-2000:])
+        self.assertIn("Web UI may be opened from [10.99.0.7/32]", out)
+        self.assertIn("Sensor API (remote sensors) may be reached from [192.168.1.125/32]", out)
+        self.assertIn("Sensor API  192.168.1.125/32  →  192.168.1.0/24", out)
+        self.assertIn("! Bait documents only report from addresses allowed to reach the console", out)   # B1
+        self.assertIn("Apply the new allow-lists now? (y/n) [y]", out)
+        rc, out = run_add(["", "192.168.1.0/24", "", "n"], TWO, mode="set-access", state=state)
+        self.assertNotEqual(rc, 0)
+        self.assertIn("cancelled — nothing changed", out)
+        self.assertNotIn("would write", out)
+
+    def test_web_ui_without_own_address_is_warned(self):
+        rc, out = run_add([], TWO, "--yes", "--allow-ui", "10.8.0.0/24", mode="set-access")
+        self.assertEqual(rc, 0, out[-2000:])
+        self.assertIn("your current address 10.99.0.7 is not in the new web UI list", out)
+
+    def test_no_install(self):
+        rc, out = run_add([], TWO, "--yes", "--allow-sensor", "10.0.0.0/8", mode="set-access", install=False)
+        self.assertNotEqual(rc, 0)
+        self.assertIn("no ReD-Pot manager found", out)
+
+
+class TestAllowListParserL3(unittest.TestCase):
+    """Security review L3: a CIDR with host bits set is refused (it used to widen silently: '1.2.3.4/0' = anyone)."""
+
+    def test_host_bits_are_refused_with_the_network_form(self):
+        r = _mod()
+        for v, net, host in (("1.2.3.4/0", "0.0.0.0/0", "1.2.3.4"), ("192.168.1.10/2", "192.0.0.0/2", "192.168.1.10"),
+                             ("10.1.2.3/8", "10.0.0.0/8", "10.1.2.3")):
+            e = r._check_allow(v)
+            self.assertIn(f"'{v}' has host bits set. Type the network ({net}) or the single address ({host}) instead", e)
+            with self.assertRaises(ValueError):
+                r._parse_allow(v)
+        self.assertIsNone(r._check_allow("10.0.0.0/8, 192.168.1.5"))
+        self.assertEqual(r._parse_allow("10.0.0.0/8, 192.168.1.5"), ["10.0.0.0/8", "192.168.1.5/32"])
+        self.assertEqual(r._parse_allow("any"), ["0.0.0.0/0"])
+        self.assertIn("'x/24' is not a network or address", r._check_allow("x/24"))
+
+    def test_unattended_host_bits_stop_set_access(self):
+        rc, out = run_add([], TWO, "--yes", "--allow-sensor", "192.168.1.10/2", mode="set-access")
+        self.assertNotEqual(rc, 0)
+        self.assertIn("'192.168.1.10/2' has host bits set", out)
+        self.assertNotIn("would write", out)
+
+    def test_interactive_shows_the_normalised_list(self):
+        state = {"mgmt": "eth0", "mgmt_ip": "10.0.0.5", "ports": {"ui": 50000, "sensor": 50001, "ssh": 50022},
+                 "move_ssh": True, "pin_ssh": False, "public_ip": None,
+                 "allow": {"ui": ["10.99.0.7/32"], "sensor": ["192.168.1.125/32"], "ssh": ["10.99.0.7/32"]}}
+        rc, out = run_add(["", "192.168.1.10/24", "192.168.1.126 192.168.1.125", "", ""], TWO, mode="set-access",
+                          state=state)
+        self.assertEqual(rc, 0, out[-2000:])
+        self.assertIn("'192.168.1.10/24' has host bits set", out)                 # asked again
+        self.assertIn("  → 192.168.1.125/32, 192.168.1.126/32", out)
+
+
+class TestStateHardening(unittest.TestCase):
+    """Security review I1/I2: lists read back from installer.json are re-validated before they reach firewall.sh;
+    installer.json / INSTALL-INFO.txt are written atomically and never through a symlink."""
+    BASE = {"mgmt": "eth0", "mgmt_ip": "10.0.0.5", "ports": {"ui": 50000, "sensor": 50001, "ssh": 50022},
+            "move_ssh": True, "pin_ssh": False, "public_ip": None}
+
+    def test_tampered_state_list_is_refused(self):
+        for bad in (["10.0.0.0/8 -j ACCEPT"], ["$(id)"], ["10.1.2.3/8"], "10.0.0.0/8", [5]):
+            st = dict(self.BASE, allow={"ui": ["0.0.0.0/0"], "sensor": bad, "ssh": ["0.0.0.0/0"]})
+            for mode, extra in (("set-access", ["--yes", "--allow-ui", "10.8.0.0/24"]), ("remove-decoy", ["--yes", "FS01"])):
+                rc, out = run_add([], TWO, *extra, mode=mode, state=st)
+                self.assertNotEqual(rc, 0, (bad, mode))
+                self.assertIn("refusing to write firewall rules from it", out)
+                self.assertNotIn("would write", out)
+
+    def test_tampered_ports_are_refused(self):
+        st = dict(self.BASE, ports={"ui": "50000; reboot", "sensor": 50001, "ssh": 50022},
+                  allow={"ui": ["0.0.0.0/0"], "sensor": ["0.0.0.0/0"], "ssh": ["0.0.0.0/0"]})
+        rc, out = run_add([], TWO, "--yes", "--allow-ui", "10.8.0.0/24", mode="set-access", state=st)
+        self.assertNotEqual(rc, 0)
+        self.assertIn("'ports' is not valid", out)
+
+    def test_write_private_is_atomic_and_never_follows_a_symlink(self):
+        r = _mod()
+        with tempfile.TemporaryDirectory() as d:
+            victim = os.path.join(d, "victim")
+            open(victim, "w").write("keep")
+            p = os.path.join(d, "installer.json")
+            os.symlink(victim, p + ".new")                     # planted temp-file link
+            r.write_private(p, "{}")
+            self.assertEqual(open(victim).read(), "keep")
+            self.assertEqual(open(p).read(), "{}")
+            self.assertEqual(os.stat(p).st_mode & 0o777, 0o600)
+            os.remove(p)
+            os.symlink(victim, p)                              # the file itself is a link: replaced, not followed
+            r.write_private(p, "new")
+            self.assertFalse(os.path.islink(p))
+            self.assertEqual(open(victim).read(), "keep")
+            self.assertNotIn("installer.json.new", os.listdir(d))
+
+
+class TestSetAccessExposureM1(unittest.TestCase):
+    """Security review M1: set-access applies the install review's H2/B9 checks. FS01 shares eth0 (10.0.0.5/24)."""
+    RESTRICTED = {"mgmt": "eth0", "mgmt_ip": "10.0.0.5", "ports": {"ui": 50000, "sensor": 50001, "ssh": 50022},
+                  "move_ssh": True, "pin_ssh": False, "public_ip": None,
+                  "allow": {"ui": ["10.99.0.7/32"], "sensor": ["192.168.1.125/32"], "ssh": ["10.99.0.7/32"]}}
+
+    def test_yes_refuses_anyone_on_a_shared_address(self):
+        rc, out = run_add([], TWO, "--yes", "--allow-ui", "0.0.0.0/0", mode="set-access", state=self.RESTRICTED)
+        self.assertNotEqual(rc, 0)
+        self.assertIn("the web UI is reachable from anywhere on 10.0.0.5, the address FS01 shares", out)
+        self.assertIn("refusing to expose the admin ports next to the decoy", out)
+        self.assertIn("add --accept-exposure", out)
+        self.assertNotIn("would write", out)
+
+    def test_yes_refuses_the_decoy_lan(self):
+        rc, out = run_add([], TWO, "--yes", "--allow-sensor", "10.0.0.0/16", mode="set-access", state=self.RESTRICTED)
+        self.assertNotEqual(rc, 0)
+        self.assertIn("the sensor API is allowed from 10.0.0.0/16, which includes 10.0.0.0/24 — the network FS01 lives in", out)
+        self.assertNotIn("would write", out)
+
+    def test_yes_with_override_applies_with_a_warning(self):
+        rc, out = run_add([], TWO, "--yes", "--allow-ssh", "10.0.0.0/24", "--accept-exposure", mode="set-access",
+                          state=self.RESTRICTED)
+        self.assertEqual(rc, 0, out[-2000:])
+        self.assertIn("host SSH is allowed from 10.0.0.0/24", out)
+        self.assertIn("--accept-exposure: applying anyway.", out)
+        self.assertIn("--dport 50022 -s 10.0.0.0/24 -j RETURN", out)
+
+    def test_interactive_confirm_defaults_to_no(self):
+        # web UI: 0.0.0.0/0 · sensor: keep · ssh: keep · exposure question: Enter (= no)
+        rc, out = run_add(["0.0.0.0/0", "", "", ""], TWO, mode="set-access", state=self.RESTRICTED)
+        self.assertNotEqual(rc, 0)
+        self.assertIn("Apply these lists anyway, visible next to the decoy? (y/n) [n]", out)
+        self.assertIn("cancelled — nothing changed", out)
+        self.assertNotIn("would write", out)
+        rc, out = run_add(["0.0.0.0/0", "", "", "y", ""], TWO, mode="set-access", state=self.RESTRICTED)
+        self.assertEqual(rc, 0, out[-2000:])
+        self.assertIn("would write", out)
+
+    def test_safe_change_needs_no_override(self):
+        rc, out = run_add([], TWO, "--yes", "--allow-sensor", "192.168.1.0/24", mode="set-access", state=self.RESTRICTED)
+        self.assertEqual(rc, 0, out[-2000:])
+        self.assertNotIn("next to the decoy", out)
+
+    def test_no_decoy_on_the_management_address_no_gate(self):
+        rc, out = run_add([], TWO, "--yes", "--allow-ui", "0.0.0.0/0", mode="set-access", state=self.RESTRICTED,
+                          existing=[{"name": "DC01", "role": "windows-domain-controller", "ip": "192.168.50.10",
+                                     "iface": "eth1"}])
+        self.assertEqual(rc, 0, out[-2000:])
+        self.assertNotIn("refusing to expose", out)
+
+    def test_unchanged_open_list_only_warns(self):
+        st = dict(self.RESTRICTED, allow=dict(self.RESTRICTED["allow"], ui=["0.0.0.0/0"]))
+        rc, out = run_add([], TWO, "--yes", "--allow-sensor", "192.168.1.0/24", mode="set-access", state=st)
+        self.assertEqual(rc, 0, out[-2000:])
+        self.assertIn("the web UI is reachable from anywhere on 10.0.0.5, the address FS01 shares — a full port scan "
+                      "shows it. (unchanged by this run)", out)
+
+
+class TestSetAccessFailureL1(unittest.TestCase):
+    """Security review L1: a failed set-access puts the previous firewall.sh back on disk (installer.json is saved
+    only after success), so disk, state and the rules in effect agree."""
+
+    def _go(self, prev_text):
+        from unittest import mock
+        r = _mod()
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "firewall.sh")
+            if prev_text is not None:
+                with open(p, "w") as f:
+                    f.write(prev_text)
+
+            def new_fw(d_, st, decoys=None):
+                with open(p, "w") as f:
+                    f.write("#!/bin/sh\n# NEW\n")
+                return True
+
+            def boom(*a, **k):
+                raise SystemExit(1)
+            old, r.A.dry_run = r.A.dry_run, False
+            try:
+                with mock.patch.object(r, "write_firewall", new_fw), mock.patch.object(r, "install_service") as svc, \
+                        mock.patch.object(r, "apply_firewall", boom), mock.patch("builtins.print"):
+                    with self.assertRaises(SystemExit):
+                        r._apply_access(d, {}, [])
+            finally:
+                r.A.dry_run = old
+            return (open(p).read() if os.path.exists(p) else None), svc.call_args_list[-1].kwargs["firewall"], \
+                (oct(os.stat(p).st_mode & 0o777) if os.path.exists(p) else None)
+
+    def test_previous_file_restored(self):
+        txt, unit_fw, mode = self._go("#!/bin/sh\n# OLD\n")
+        self.assertEqual(txt, "#!/bin/sh\n# OLD\n")
+        self.assertTrue(unit_fw)
+        self.assertEqual(mode, "0o700")
+
+    def test_no_previous_file_removed_again(self):
+        txt, unit_fw, _ = self._go(None)
+        self.assertIsNone(txt)
+        self.assertFalse(unit_fw)
+
+
+class TestCutRemovedSessionsL2(unittest.TestCase):
+    """Security review L2: after narrowing a list, open connections from removed sources are cut (conntrack), never
+    the current SSH client or the manager itself; without conntrack the output says they stay open."""
+    ST = {"ifs": {"eth0": {"ip": "10.0.0.5"}}, "mgmt": "eth0", "move_ssh": True,
+          "ports": {"ui": 50000, "sensor": 50001, "ssh": 50022}}
+    OUT = ("tcp      6 431999 ESTABLISHED src=192.168.1.125 dst=10.0.0.5 sport=51234 dport=50001 src=172.18.0.2 "
+           "dst=192.168.1.125 sport=8741 dport=51234 [ASSURED] mark=0 use=1\n"
+           "tcp      6 431999 ESTABLISHED src=192.168.1.126 dst=10.0.0.5 sport=51000 dport=50001 src=172.18.0.2 "
+           "dst=192.168.1.126 sport=8741 dport=51000 [ASSURED] mark=0 use=1\n"
+           "tcp      6 431999 ESTABLISHED src=10.99.0.7 dst=10.0.0.5 sport=40000 dport=50001 src=172.18.0.2 "
+           "dst=10.99.0.7 sport=8741 dport=40000 [ASSURED] mark=0 use=1\n"
+           "tcp      6 431999 ESTABLISHED src=192.168.1.127 dst=10.9.9.9 sport=40001 dport=50001 src=10.9.9.9 "
+           "dst=192.168.1.127 sport=50001 dport=40001 [ASSURED] mark=0 use=1\n")
+
+    def go(self, old, new, which="/usr/sbin/conntrack", dry=False):
+        from unittest import mock
+        r = _mod()
+        calls = []
+
+        def fake_run(cmd, check=True, capture=False, quiet=False, new_session=False):
+            calls.append(" ".join(cmd))
+            return subprocess.CompletedProcess(cmd, 0, self.OUT if "-L" in cmd else "", "")
+        old_dry, r.A.dry_run = r.A.dry_run, dry
+        try:
+            with mock.patch.object(r.shutil, "which", lambda n: which), mock.patch.object(r, "run", fake_run), \
+                    mock.patch.object(r, "ssh_session_ip_client", lambda: "10.99.0.7"), \
+                    mock.patch("builtins.print") as pr:
+                r.cut_removed_sessions(self.ST, old, new)
+        finally:
+            r.A.dry_run = old_dry
+        return calls, " ".join(str(a) for c in pr.call_args_list for a in c.args)
+
+    def test_removed_source_is_cut_kept_ones_are_not(self):
+        old = {"ui": ["10.99.0.7/32"], "sensor": ["192.168.1.0/24"], "ssh": ["10.99.0.7/32"]}
+        new = dict(old, sensor=["192.168.1.126/32"])
+        calls, msg = self.go(old, new)
+        self.assertEqual(calls, ["/usr/sbin/conntrack -L -p tcp --orig-port-dst 50001",
+                                 "/usr/sbin/conntrack -D -p tcp -s 10.99.0.7 -d 10.0.0.5 --orig-port-dst 50001",
+                                 "/usr/sbin/conntrack -D -p tcp -s 192.168.1.125 -d 10.0.0.5 --orig-port-dst 50001"])
+        self.assertIn("2 source(s) cut", msg)                   # .126 still allowed; .127 went to another address
+
+    def test_without_conntrack_it_says_so(self):
+        old = {"ui": ["0.0.0.0/0"], "sensor": ["0.0.0.0/0"], "ssh": ["0.0.0.0/0"]}
+        calls, msg = self.go(old, dict(old, ui=["10.8.0.0/24"]), which=None)
+        self.assertEqual(calls, [])
+        self.assertIn("stay open until they close", msg)
+
+    def test_widening_or_unchanged_cuts_nothing(self):
+        old = {"ui": ["10.8.0.0/24"], "sensor": ["0.0.0.0/0"], "ssh": ["10.8.0.0/24"]}
+        calls, _ = self.go(old, dict(old, ui=["0.0.0.0/0"]))
+        self.assertEqual(calls, [])
+
+    def test_dry_run_changes_nothing(self):
+        old = {"ui": ["0.0.0.0/0"], "sensor": ["0.0.0.0/0"], "ssh": ["0.0.0.0/0"]}
+        calls, msg = self.go(old, dict(old, ui=["10.8.0.0/24"]), dry=True)
+        self.assertEqual(calls, [])
+        self.assertIn("would cut open connections to port(s) 50000", msg)
+
+    def test_ssh_is_never_cut(self):
+        """Re-review R2-L1: inside tmux/screen the admin's own SSH session can come from an address this run cannot
+        see, so host SSH sessions are never cut automatically — only a hint is printed."""
+        old = {"ui": ["10.99.0.7/32"], "sensor": ["0.0.0.0/0"], "ssh": ["0.0.0.0/0"]}
+        calls, msg = self.go(old, dict(old, ssh=["10.8.0.0/24"]))
+        self.assertEqual(calls, [])
+        self.assertIn("Host SSH: sessions that are already open stay open (never cut automatically", msg)
+        self.assertIn("sport = :50022", msg)
+
+
+class TestAddDecoyExposureR2L3(unittest.TestCase):
+    """Re-review R2-L3: add-decoy onto the management interface runs the same exposure gate as set-access; the
+    sharing is new, so every list counts (also lists that were already restricted but contain the mgmt LAN)."""
+    EXISTING = [{"name": "FS01", "role": "windows-file-server", "ip": "192.168.50.10", "iface": "eth1"}]
+
+    def state(self, **allow):
+        return {"mgmt": "eth0", "mgmt_ip": "10.0.0.5", "ports": {"ui": 50000, "sensor": 50001, "ssh": 22},
+                "move_ssh": False, "pin_ssh": True, "allow": allow}
+
+    def test_yes_anyone_needs_accept_exposure(self):
+        args = ["--yes", "--decoy-if", "eth0", "--roles", "linux-web-hosting", "--allow-ui", "0.0.0.0/0",
+                "--allow-sensor", "10.8.0.0/24", "--allow-ssh", "10.8.0.0/24"]
+        rc, out = run_add([], TWO, *args, existing=self.EXISTING, state=self.state())
+        self.assertNotEqual(rc, 0)
+        self.assertIn("the web UI is reachable from anywhere on 10.0.0.5, the address WEB01 shares", out)
+        self.assertIn("add --accept-exposure", out)
+        self.assertNotIn("ctl add-sensor", out)
+        rc, out = run_add([], TWO, *args, "--accept-exposure", existing=self.EXISTING, state=self.state())
+        self.assertEqual(rc, 0, out[-2000:])
+        self.assertIn("--accept-exposure: applying anyway.", out)
+
+    def test_restricted_list_with_the_mgmt_lan_is_gated(self):
+        st = self.state(ui=["10.8.0.0/24"], sensor=["10.8.0.0/24"], ssh=["10.0.0.0/24"])     # eth0 = 10.0.0.0/24
+        rc, out = run_add([], TWO, "--yes", "--decoy-if", "eth0", "--roles", "linux-web-hosting",
+                          existing=self.EXISTING, state=st)
+        self.assertNotEqual(rc, 0)
+        self.assertIn("host SSH is allowed from 10.0.0.0/24, the network WEB01 lives in.", out)   # QA Q4 wording
+        self.assertNotIn("(unchanged by this run)", out)
+        self.assertNotIn("ctl add-sensor", out)
+
+    def test_interactive_confirm_defaults_to_no(self):
+        st = self.state(ui=["10.8.0.0/24"], sensor=["10.8.0.0/24"], ssh=["10.0.0.0/24"])
+        rc, out = run_add(["1", "linux-web-hosting", "", "", ""], TWO, existing=self.EXISTING, state=st)
+        self.assertNotEqual(rc, 0)
+        self.assertIn("Apply these lists anyway, visible next to the decoy? (y/n) [n]", out)
+        self.assertIn("cancelled — nothing changed", out)
+        self.assertNotIn("ctl add-sensor", out)
+
+    def test_safe_lists_pass(self):
+        st = self.state(ui=["10.8.0.0/24"], sensor=["10.8.0.0/24"], ssh=["10.8.0.0/24"])
+        rc, out = run_add([], TWO, "--yes", "--decoy-if", "eth0", "--roles", "linux-web-hosting",
+                          existing=self.EXISTING, state=st)
+        self.assertEqual(rc, 0, out[-2000:])
+        self.assertNotIn("next to the decoy", out)
+
+
+COMPOSE_100 = ("services:\n  console:\n    image: rpot:1.0.0\n    command: [\"console\"]\n"
+               "  fs01:\n    image: rpot:1.0.0\n    command: [\"sensor\"]\n")
+
+
+class TestUpdateInPlace(unittest.TestCase):
+    """RC-35: sudo ./install.sh update (1.0.0 → 1.0.1 in place). Dry-run against a fake install: nothing written."""
+
+    def test_manager_dry_run_plan(self):
+        rc, out = run_add([], TWO, "--yes", mode="update", compose=COMPOSE_100)
+        self.assertEqual(rc, 0, out[-2500:])
+        self.assertIn("Update ReD-Pot manager 1.0.0 → 1.0.1", out)
+        self.assertIn("would back up to", out)
+        self.assertIn("the console database (sqlite backup API)", out)
+        self.assertIn("ctl compose -d /d --ui-bind 10.0.0.5", out)
+        self.assertIn("would write", out)                                  # firewall.sh (make-before-break)
+        self.assertIn("systemctl restart redpot", out)
+        self.assertIn("ReD-Pot manager updated to 1.0.1", out)
+        self.assertNotIn("ctl init", out)                                  # persona / baits / token kept
+        self.assertLess(out.index("would back up to"), out.index("ctl compose"))   # backup before any change
+
+    def test_already_up_to_date(self):
+        rc, out = run_add([], TWO, "--yes", mode="update", compose=COMPOSE_100.replace("1.0.0", "1.0.1"))
+        self.assertEqual(rc, 0, out[-1500:])
+        self.assertIn("is already up to date (1.0.1)", out)
+        self.assertNotIn("would back up", out)
+
+    def test_unsupported_and_unknown_versions_refused(self):
+        for comp, msg in ((COMPOSE_100.replace("1.0.0", "0.4.0"), "no in-place update from 0.4.0 to 1.0.1"),
+                          (COMPOSE_100.replace("rpot:1.0.0\n    command: [\"sensor\"]", "rpot:0.9.9\n    command: [\"sensor\"]"),
+                           "cannot tell the installed version"),
+                          ("services: {}\n", "cannot tell the installed version")):
+            rc, out = run_add([], TWO, "--yes", mode="update", compose=comp)
+            self.assertNotEqual(rc, 0, comp)
+            self.assertIn(msg, out)
+            self.assertNotIn("would back up", out)
+
+    def test_interactive_cancel(self):
+        rc, out = run_add(["n"], TWO, mode="update", compose=COMPOSE_100)
+        self.assertNotEqual(rc, 0)
+        self.assertIn("Update now? (y/n) [y]", out)
+        self.assertIn("cancelled — nothing changed", out)
+
+    def test_sensor_dry_run(self):
+        with tempfile.TemporaryDirectory() as d:
+            os.makedirs(os.path.join(d, "conf"))
+            open(os.path.join(d, "conf", "sensor.json"), "w").write("{}")
+            open(os.path.join(d, "docker-compose.yml"), "w").write(
+                "services:\n  relay:\n    image: rpot:1.0.0\n  web01:\n    image: rpot:1.0.0\n")
+            env = dict(os.environ, RPOT_TEST_IFACES=json.dumps(TWO), RPOT_TEST_SSH_IP="10.0.0.5",
+                       SSH_CONNECTION="10.99.0.7 50000 10.0.0.5 22")
+            p = subprocess.run([sys.executable, INSTALLER, "update", "--dry-run", "--yes", "--dir", d],
+                               capture_output=True, text=True, env=env, timeout=60)
+            out = ANSI.sub("", p.stdout + p.stderr)
+            self.assertEqual(p.returncode, 0, out[-1500:])
+            self.assertIn("Update ReD-Pot sensor 1.0.0 → 1.0.1", out)
+            self.assertIn("would set image rpot:1.0.1", out)
+            self.assertIn("systemctl restart redpot-sensor", out)
+            self.assertNotIn("database (sqlite backup API)", out)
+            self.assertEqual(open(os.path.join(d, "docker-compose.yml")).read().count("rpot:1.0.0"), 2)   # untouched
+
+
+class TestUpdateBackupAndRollback(unittest.TestCase):
+    """Backup (real sqlite backup API, owners/modes recorded, OUTSIDE the install dir) and the rollback path, with
+    run() / systemctl stubbed. Runs as root in CI and here (chown to 10001)."""
+
+    def setUp(self):
+        from unittest import mock
+        self.mock = mock
+        self.r = _mod()
+        self.td = tempfile.TemporaryDirectory()
+        self.addCleanup(self.td.cleanup)
+        self.d = os.path.join(self.td.name, "manager")
+        os.makedirs(self.d)
+        for n, t in (("docker-compose.yml", COMPOSE_100), ("firewall.sh", "#!/bin/sh\n# OLD 1.0.0\n"),
+                     ("installer.json", json.dumps({"mgmt_ip": "10.0.0.5", "ports": {"ui": 50000}})),
+                     ("rpot.json", '{"version": 2, "old": true}')):
+            open(os.path.join(self.d, n), "w").write(t)
+        if os.geteuid() == 0:                           # as rpotctl compose leaves them: the console (10001) reads them
+            os.chown(os.path.join(self.d, "rpot.json"), 10001, 10001)
+        os.chmod(os.path.join(self.d, "rpot.json"), 0o600)
+        self.unit = os.path.join(self.td.name, "redpot.service")
+        open(self.unit, "w").write("[Unit]\n# OLD\n")
+        os.chmod(self.unit, 0o644)
+        self.broot = os.path.join(self.td.name, "backups")
+        import sqlite3
+        self.db = os.path.join(self.td.name, "vol", "rpot.db")
+        os.makedirs(os.path.dirname(self.db))
+        c = sqlite3.connect(self.db)
+        c.execute("PRAGMA journal_mode=WAL")
+        c.execute("CREATE TABLE events(id INTEGER PRIMARY KEY, x TEXT)")
+        c.executemany("INSERT INTO events(x) VALUES(?)", [(str(i),) for i in range(500)])
+        c.commit()
+        self.live = c                                   # stays open: a live WAL database
+        self.addCleanup(c.close)
+        self.calls, self.https = [], True
+        self.old_dry, self.r.A.dry_run = self.r.A.dry_run, False
+        self.addCleanup(setattr, self.r.A, "dry_run", self.old_dry)
+
+    def fake_run(self, cmd, check=True, capture=False, quiet=False, env=None, new_session=False):
+        t = cmd if isinstance(cmd, str) else " ".join(cmd)
+        self.calls.append(t)
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    def patches(self):
+        m = self.mock
+        return [m.patch.object(self.r, "UNIT_FILE", os.path.join(self.td.name, "{}.service")),
+                m.patch.object(self.r, "UPDATE_BACKUP_ROOT", self.broot),
+                m.patch.object(self.r, "_db_path", lambda kind, d: self.db),
+                m.patch.object(self.r, "run", self.fake_run),
+                m.patch.object(self.r, "firewall_in_effect", lambda d: True),
+                m.patch.object(self.r, "wait_https", lambda h, p, secs=90: self.https),
+                m.patch("builtins.print")]
+
+    def stack(self):
+        import contextlib
+        s = contextlib.ExitStack()
+        for p in self.patches():
+            s.enter_context(p)
+        return s
+
+    def break_install(self):
+        """What a failed update leaves: new files, written as root."""
+        for n, t in (("docker-compose.yml", "image: rpot:1.0.1\n"), ("firewall.sh", "#!/bin/sh\n# NEW\n"),
+                     ("rpot.json", '{"version": 2, "new": true}')):
+            p = os.path.join(self.d, n)
+            open(p, "w").write(t)
+            os.chown(p, 0, 0) if os.geteuid() == 0 else None
+        open(self.unit, "w").write("[Unit]\n# NEW\n")
+
+    def test_backup_is_consistent_private_and_outside_the_install(self):
+        import sqlite3
+        with self.stack():
+            self.live.execute("BEGIN")
+            self.live.execute("INSERT INTO events(x) VALUES('uncommitted')")       # in flight: not in the backup
+            b = self.r.backup_install("manager", self.d, "1.0.0")
+            self.live.execute("ROLLBACK")
+        self.assertTrue(b.startswith(self.broot + os.sep))                          # R3-L4: not in the install dir
+        self.assertFalse(any(x.startswith("backup") for x in os.listdir(self.d)))
+        self.assertEqual(os.stat(self.broot).st_mode & 0o777, 0o700)
+        self.assertEqual(os.stat(b).st_mode & 0o777, 0o700)
+        for n in ("docker-compose.yml", "firewall.sh", "installer.json", "rpot.json", "redpot.service", "rpot.db",
+                  "meta.json"):
+            self.assertTrue(os.path.isfile(os.path.join(b, n)), n)
+            self.assertEqual(os.stat(os.path.join(b, n)).st_mode & 0o777, 0o600, n)
+        meta = json.load(open(os.path.join(b, "meta.json")))
+        self.assertEqual(meta["rpot.json"]["mode"], 0o600)
+        if os.geteuid() == 0:
+            self.assertEqual(meta["rpot.json"]["uid"], 10001)
+        c = sqlite3.connect(os.path.join(b, "rpot.db"))
+        self.assertEqual(c.execute("SELECT COUNT(*) FROM events").fetchone()[0], 500)
+        self.assertEqual(c.execute("PRAGMA integrity_check").fetchone()[0], "ok")
+        c.close()
+
+    def test_rollback_keeps_owner_and_mode(self):
+        """Security review R3-M1: a 10001-owned rpot.json must stay 10001-owned, or the 1.0.0 console cannot read it."""
+        with self.stack():
+            b = self.r.backup_install("manager", self.d, "1.0.0")
+            self.break_install()
+            bad = self.r._rollback("manager", self.d, b, "1.0.0", "#!/bin/sh\n# NEW\n")
+        self.assertEqual(bad, [])
+        st = os.stat(os.path.join(self.d, "rpot.json"))
+        self.assertEqual(st.st_mode & 0o777, 0o600)
+        if os.geteuid() == 0:
+            self.assertEqual((st.st_uid, st.st_gid), (10001, 10001))
+        self.assertEqual(os.stat(self.unit).st_mode & 0o777, 0o644)
+        self.assertEqual(open(os.path.join(self.d, "rpot.json")).read(), '{"version": 2, "old": true}')
+        self.assertEqual(open(os.path.join(self.d, "docker-compose.yml")).read(), COMPOSE_100)
+        self.assertEqual(open(os.path.join(self.d, "firewall.sh")).read(), "#!/bin/sh\n# OLD 1.0.0\n")
+        self.assertEqual(open(self.unit).read(), "[Unit]\n# OLD\n")
+        self.assertIn("systemctl daemon-reload", self.calls)
+        self.assertIn("systemctl restart redpot", self.calls)
+        self.assertTrue(any(c.endswith("firewall.sh.new-gen drop -B") for c in self.calls), self.calls)
+
+    def test_rollback_needs_the_console_back(self):
+        with self.stack():
+            b = self.r.backup_install("manager", self.d, "1.0.0")
+            self.break_install()
+            self.https = False
+            bad = self.r._rollback("manager", self.d, b, "1.0.0", None)
+        self.assertTrue(any("the console does not answer on 10.0.0.5:50000" in x for x in bad), bad)
+
+    def test_rollback_reports_what_is_wrong(self):
+        with self.stack() as s:
+            b = self.r.backup_install("manager", self.d, "1.0.0")
+            s.enter_context(self.mock.patch.object(self.r, "run", lambda cmd, **k: subprocess.CompletedProcess(
+                cmd, 1 if "restart" in cmd else 0, "", "")))
+            s.enter_context(self.mock.patch.object(self.r, "firewall_in_effect", lambda d: False))
+            bad = self.r._rollback("manager", self.d, b, "1.0.0", None)
+        self.assertTrue(any("systemctl restart redpot failed" in x for x in bad), bad)
+        self.assertTrue(any("firewall is NOT in effect" in x for x in bad), bad)
+
+    def run_update(self, failing):
+        """update() with the heavy parts stubbed; `failing` replaces _update_manager."""
+        with self.stack() as s:
+            for name, val in (("_update_manager", failing), ("_detect_install", lambda: ("manager", self.d)),
+                              ("_existing_manager", lambda d: {}), ("ensure_docker", lambda: None),
+                              ("ensure_image", lambda: None), ("_installed_edition", lambda img: "community")):
+                s.enter_context(self.mock.patch.object(self.r, name, val))
+            s.enter_context(self.mock.patch.object(self.r.A, "yes", True))
+            die = s.enter_context(self.mock.patch.object(self.r, "die", side_effect=SystemExit))
+            out = sys.stdout
+            try:
+                with self.assertRaises(SystemExit):
+                    self.r.update()
+            finally:
+                sys.stdout = out
+            return " ".join(str(a) for c in die.call_args_list for a in c.args)
+
+    def test_failed_update_rolls_back_everything(self):
+        def broken(d):
+            self.break_install()
+            return False
+        msg = self.run_update(broken)
+        self.assertIn("ROLLED BACK", msg)
+        self.assertIn("runs 1.0.0 again (image rpot:1.0.0)", msg)
+        self.assertEqual(open(os.path.join(self.d, "rpot.json")).read(), '{"version": 2, "old": true}')
+        self.assertFalse(os.path.exists(os.path.join(self.broot, "update-in-progress-manager.json")))   # done
+
+    def test_any_exception_rolls_back(self):
+        """Security review R3-L1: e.g. EIO from printing to a dropped SSH session."""
+        def broken(d):
+            self.break_install()
+            raise OSError(5, "Input/output error")
+        msg = self.run_update(broken)
+        self.assertIn("ROLLED BACK", msg)
+        self.assertEqual(open(os.path.join(self.d, "docker-compose.yml")).read(), COMPOSE_100)
+
+    def test_incomplete_rollback_keeps_the_marker_and_says_what_to_do(self):
+        def broken(d):
+            self.break_install()
+            self.https = False                          # the old console does not come back
+            return False
+        msg = self.run_update(broken)
+        self.assertIn("ROLLBACK INCOMPLETE", msg)
+        self.assertIn("run sudo ./install.sh update again: it retries the rollback first", msg)
+        self.assertTrue(os.path.isfile(os.path.join(self.broot, "update-in-progress-manager.json")))
+
+    def start_marker(self, b, **extra):
+        mk = {"from": "1.0.0", "to": "1.0.1", "backup": b, "dir": self.d, "started": "x",
+              "seen": {k: [h] for k, h in self.r._file_hashes("manager", self.d).items()}}
+        mk.update(extra)
+        self.r.write_private(os.path.join(self.broot, "update-in-progress-manager.json"), json.dumps(mk))
+
+    def test_interrupted_update_is_rolled_back_on_the_next_run(self):
+        """R3-L5 / R4-L2: SIGKILL after the update rewrote files: the next run (with --resume-rollback) rolls back."""
+        with self.stack() as s:
+            b = self.r.backup_install("manager", self.d, "1.0.0")
+            self.start_marker(b)
+            self.break_install()                        # the update's own writes ...
+            self.r._marker_seen("manager", self.d)      # ... recorded step by step, as _update_manager does
+            s.enter_context(self.mock.patch.object(self.r.A, "resume_rollback", True, create=True))
+            self.r._resume_interrupted("manager", self.d)
+        self.assertEqual(self.r.installed_version(self.d), "1.0.0")
+        self.assertFalse(os.path.exists(os.path.join(self.broot, "update-in-progress-manager.json")))
+        if os.geteuid() == 0:
+            self.assertEqual(os.stat(os.path.join(self.d, "rpot.json")).st_uid, 10001)
+
+    def _resume_dies(self, **flags):
+        with self.stack() as s:
+            for k, v in flags.items():
+                s.enter_context(self.mock.patch.object(self.r.A, k, v, create=True))
+            die = s.enter_context(self.mock.patch.object(self.r, "die", side_effect=SystemExit))
+            with self.assertRaises(SystemExit):
+                self.r._resume_interrupted("manager", self.d)
+            return str(die.call_args)
+
+    def test_changes_after_the_update_block_the_rollback(self):
+        """R4-L2: a file changed later (e.g. set-access weeks after a ROLLBACK INCOMPLETE) → refuse, do not restore."""
+        with self.stack():
+            b = self.r.backup_install("manager", self.d, "1.0.0")
+            self.start_marker(b)
+            open(os.path.join(self.d, "installer.json"), "w").write('{"later": "set-access"}')
+        msg = self._resume_dies(resume_rollback=True)
+        self.assertIn("changed AFTER it", msg)
+        self.assertIn("installer.json", msg)
+        self.assertEqual(open(os.path.join(self.d, "installer.json")).read(), '{"later": "set-access"}')   # untouched
+
+    def test_marker_of_another_dir_is_refused(self):
+        with self.stack():
+            b = self.r.backup_install("manager", self.d, "1.0.0")
+            self.start_marker(b, dir="/opt/elsewhere")
+        self.assertIn("belongs to an update of '/opt/elsewhere'", self._resume_dies(resume_rollback=True))
+
+    def test_yes_alone_does_not_roll_back(self):
+        with self.stack():
+            b = self.r.backup_install("manager", self.d, "1.0.0")
+            self.start_marker(b)
+        msg = self._resume_dies(yes=True, resume_rollback=False)
+        self.assertIn("sudo ./install.sh update --resume-rollback", msg)
+        self.assertTrue(os.path.exists(os.path.join(self.broot, "update-in-progress-manager.json")))
+
+    def test_marker_backup_outside_the_backup_root_is_refused(self):
+        with self.stack():
+            os.makedirs(self.broot, mode=0o700)
+            self.start_marker("/etc")
+        self.assertIn("names a backup outside", self._resume_dies(resume_rollback=True))
+
+    def test_add_decoy_and_set_access_refuse_while_a_marker_exists(self):
+        with self.stack() as s:
+            os.makedirs(self.broot, mode=0o700)
+            self.start_marker(os.path.join(self.broot, "x"))
+            die = s.enter_context(self.mock.patch.object(self.r, "die", side_effect=SystemExit))
+            with self.assertRaises(SystemExit):
+                self.r._add_context(self.d, slots=False)          # add-decoy, remove-decoy and set-access use it
+        self.assertIn("did not finish", str(die.call_args))
+        self.assertIn("Run sudo ./install.sh update first", str(die.call_args))
+
+    def test_uninstall_clears_the_marker_and_the_backups(self):
+        with self.stack() as s:
+            b = self.r.backup_install("manager", self.d, "1.0.0")
+            self.start_marker(b)
+            other = os.path.join(self.broot, "20260101T000000-sensor-1.0.0")
+            os.makedirs(other)
+            s.enter_context(self.mock.patch.object(self.r, "INSTALL_DIRS", (self.d,)))
+            s.enter_context(self.mock.patch.object(self.r, "UNIT_DIR", self.td.name))
+            for name in ("restore_ssh", "unpin_ssh", "restore_stopped", "remove_pinned_route"):
+                s.enter_context(self.mock.patch.object(self.r, name, lambda *a: None))
+            s.enter_context(self.mock.patch.object(self.r, "MOTD", os.path.join(self.td.name, "nomotd")))
+            s.enter_context(self.mock.patch.object(self.r.A, "yes", True))
+            s.enter_context(self.mock.patch.object(self.r.A, "dir", None))
+            s.enter_context(self.mock.patch.object(self.r.A, "keep_data", False))
+            s.enter_context(self.mock.patch.object(self.r.A, "purge_image", False))
+            plan = self.r.uninstall_plan([("redpot", self.d, "redpot")], False, False)
+            self.r.uninstall()
+        self.assertTrue(any("unfinished-update marker" in x for x in plan), plan)
+        self.assertTrue(any("update backup(s) of the manager" in x for x in plan), plan)
+        self.assertFalse(os.path.exists(os.path.join(self.broot, "update-in-progress-manager.json")))
+        self.assertFalse(os.path.exists(b))
+        self.assertTrue(os.path.isdir(other))                     # another install's backups are not touched
+
+    def test_restore_refuses_symlinks_and_foreign_meta_paths(self):
+        with self.stack():
+            b = self.r.backup_install("manager", self.d, "1.0.0")
+            meta = json.load(open(os.path.join(b, "meta.json")))
+            meta["rpot.json"]["path"] = "/etc/passwd"             # tampered meta.json
+            self.r.write_private(os.path.join(b, "meta.json"), json.dumps(meta))
+            target = os.path.join(self.td.name, "elsewhere")
+            open(target, "w").write("keep")
+            os.remove(os.path.join(self.d, "installer.json"))
+            os.symlink(target, os.path.join(self.d, "installer.json"))
+            bad = self.r._rollback("manager", self.d, b, "1.0.0", None)
+        self.assertTrue(any("'rpot.json' is not one of this install's files" in x for x in bad), bad)
+        self.assertTrue(any("is a symlink" in x for x in bad), bad)
+        self.assertEqual(open(target).read(), "keep")
+
+    def test_edition_probe_is_locked_down(self):
+        seen = []
+        with self.stack() as s:
+            s.enter_context(self.mock.patch.object(self.r, "run", lambda cmd, **k: seen.append(cmd) or
+                                                   subprocess.CompletedProcess(cmd, 0, "community\n" if "--entrypoint" in cmd
+                                                                              else "<no value>\n", "")))
+            self.assertEqual(self.r._installed_edition("rpot:1.0.0"), "community")
+        probe = seen[-1]
+        self.assertEqual(probe[:2], ["timeout", "60"])
+        for flag in ("--read-only", "--network", "--cap-drop", "--pids-limit", "--memory"):
+            self.assertIn(flag, probe)
+        self.assertIn("no-new-privileges", probe)
+        self.assertIn("10001:10001", probe)
+
+    def test_other_edition_refused(self):
+        with self.stack() as s:
+            for name, val in (("_detect_install", lambda: ("manager", self.d)), ("_existing_manager", lambda d: {}),
+                              ("_installed_edition", lambda img: "enterprise")):
+                s.enter_context(self.mock.patch.object(self.r, name, val))
+            s.enter_context(self.mock.patch.object(self.r.A, "yes", True))
+            die = s.enter_context(self.mock.patch.object(self.r, "die", side_effect=SystemExit))
+            with self.assertRaises(SystemExit):
+                self.r.update()
+        self.assertIn("is the enterprise edition, this installer is the community edition", str(die.call_args))
+        self.assertFalse(os.path.exists(self.broot))                          # refused before the backup
+
+    def test_ctrl_c_before_any_change_says_nothing_changed(self):
+        """R3-L5: EXECUTING (→ 'Interrupted during installation … uninstall') is set only in the critical part."""
+        def interrupt():
+            raise KeyboardInterrupt
+        with self.stack() as s:
+            for name, val in (("_detect_install", lambda: ("manager", self.d)), ("_existing_manager", lambda d: {}),
+                              ("_installed_edition", lambda img: "community"), ("ensure_docker", lambda: None),
+                              ("ensure_image", interrupt)):
+                s.enter_context(self.mock.patch.object(self.r, name, val))
+            s.enter_context(self.mock.patch.object(self.r.A, "yes", True))
+            self.r.EXECUTING = False
+            with self.assertRaises(KeyboardInterrupt):
+                self.r.update()
+        self.assertFalse(self.r.EXECUTING)
+        self.assertEqual(open(os.path.join(self.d, "docker-compose.yml")).read(), COMPOSE_100)
+        self.assertFalse(os.path.exists(os.path.join(self.broot, "update-in-progress-manager.json")))
+
+    def test_firewall_script_has_drop_action(self):
+        txt, _ = self.r.firewall_text("10.0.0.5", {"ui": ["10.8.0.0/24"]}, {"ui": 1, "sensor": 2, "ssh": 22}, False)
+        self.assertIn('drop) [ "$2" = -B ] && dropgen -B ;;', txt)
+
+    def test_dockerfile_labels_the_edition(self):
+        self.assertIn('io.redside.edition="community"', open(os.path.join(REPO, "Dockerfile")).read())
+
+
+class TestUpdateEndToEnd(TestUpdateBackupAndRollback):
+    """U-1 (VM test): a SUCCESSFUL update through the real update() → _update_manager / _update_sensor path, with
+    the real marker guard (it used to block the update on its own marker). docker / systemctl are faked: the fake
+    `ctl compose` writes the new compose file like rpotctl does; nothing on the host is touched."""
+
+    def setUp(self):
+        super().setUp()
+        json.dump({"version": 2, "network": {"mode": "host"}, "console": {"mgmt_ip": "10.0.0.5"},
+                   "sensors": [{"name": "FS01", "role": "windows-file-server", "ip": "10.0.0.5", "iface": "eth0"}],
+                   "tokens": {}}, open(os.path.join(self.d, "rpot.json"), "w"))
+        json.dump({"mgmt": "eth0", "mgmt_ip": "10.0.0.5", "ports": {"ui": 50000, "sensor": 50001, "ssh": 50022},
+                   "move_ssh": True, "pin_ssh": False, "public_ip": None,
+                   "allow": {"ui": ["10.99.0.7/32"], "sensor": ["10.99.0.7/32"], "ssh": ["10.99.0.7/32"]}},
+                  open(os.path.join(self.d, "installer.json"), "w"))
+
+    def fake_run(self, cmd, check=True, capture=False, quiet=False, env=None, new_session=False):
+        t = cmd if isinstance(cmd, str) else " ".join(cmd)
+        self.calls.append(t)
+        if "ctl compose" in t:                          # what rpotctl compose does inside the new image
+            comp = os.path.join(self.compose_dir, "docker-compose.yml")
+            open(comp, "w").write(COMPOSE_100.replace("rpot:1.0.0-hotfix1", "rpot:1.0.0").replace("1.0.0", "1.0.1"))
+        out = "relay\ndecoy\n" if "ps --status running" in t else ""
+        return subprocess.CompletedProcess(cmd, 0, out, "")
+
+    def run_real_update(self, kind="manager", d=None):
+        self.compose_dir = d or self.d
+        with self.stack() as s:
+            s.enter_context(self.mock.patch.dict(os.environ, {"RPOT_TEST_IFACES": json.dumps(TWO)}))
+            for name, val in (("ensure_docker", lambda: None), ("ensure_image", lambda: None),
+                              ("_installed_edition", lambda img: "community"),
+                              ("self_test", lambda project, decoys, secs=45, d=None: True),
+                              ("install_service", lambda unit, d, project, desc, firewall=False, pre=(), post=(),
+                               start=True: open(self.r.UNIT_FILE.format(unit), "w").write("[Unit]\n# NEW\n"))):
+                s.enter_context(self.mock.patch.object(self.r, name, val))
+            s.enter_context(self.mock.patch.object(self.r.A, "yes", True))
+            s.enter_context(self.mock.patch.object(self.r.A, "dir", self.compose_dir, create=True))
+            out = s.enter_context(self.mock.patch("builtins.print"))
+            stdout = sys.stdout
+            try:
+                self.r.update()                           # must not raise: no die(), no rollback
+            finally:
+                sys.stdout = stdout
+            return " ".join(str(a) for c in out.call_args_list for a in c.args)
+
+    def test_successful_manager_update(self):
+        msg = self.run_real_update()
+        self.assertIn("ReD-Pot manager updated to 1.0.1", msg)
+        self.assertNotIn("ROLLED BACK", msg)
+        self.assertNotIn("did not finish", msg)
+        self.assertEqual(self.r.installed_version(self.d), "1.0.1")
+        self.assertIn("dropgen", open(os.path.join(self.d, "firewall.sh")).read())   # new make-before-break script
+        self.assertIn("systemctl restart redpot", self.calls)
+        self.assertFalse(os.path.exists(os.path.join(self.broot, "update-in-progress-manager.json")))
+        self.assertEqual(len([n for n in os.listdir(self.broot) if n.endswith("-manager-1.0.0")]), 1)
+
+    def test_successful_update_from_the_hotfix(self):
+        comp = os.path.join(self.d, "docker-compose.yml")
+        open(comp, "w").write(COMPOSE_100.replace("    image: rpot:1.0.0\n    command: [\"console\"]",
+                                                  "    image: rpot:1.0.0-hotfix1\n    command: [\"console\"]"))
+        self.assertEqual(self.r.installed_images(self.d), ["rpot:1.0.0-hotfix1", "rpot:1.0.0"])
+        self.assertEqual(self.r.installed_version(self.d), "1.0.0")
+        msg = self.run_real_update()
+        self.assertIn("The hotfix rpot:1.0.0-hotfix1 on this manager is superseded by 1.0.1", msg)
+        self.assertIn("ReD-Pot manager updated to 1.0.1", msg)
+        self.assertEqual(self.r.installed_version(self.d), "1.0.1")
+
+    def test_successful_sensor_update(self):
+        sd = os.path.join(self.td.name, "sensor")
+        os.makedirs(os.path.join(sd, "conf"))
+        open(os.path.join(sd, "conf", "sensor.json"), "w").write('{"sensor": {"name": "WEB01"}}')
+        open(os.path.join(sd, "docker-compose.yml"), "w").write(
+            "services:\n  relay:\n    image: rpot:1.0.0\n  web01:\n    image: rpot:1.0.0\n")
+        msg = self.run_real_update("sensor", sd)
+        self.assertIn("ReD-Pot sensor updated to 1.0.1", msg)
+        self.assertEqual(self.r.installed_version(sd), "1.0.1")
+        self.assertIn("systemctl restart redpot-sensor", self.calls)
+        self.assertFalse(os.path.exists(os.path.join(self.broot, "update-in-progress-sensor.json")))
+
+    def test_rollback_message_names_the_restored_images(self):
+        """U-2: a hotfixed install is rolled back to rpot:1.0.0-hotfix1 — the message must say so."""
+        comp = os.path.join(self.d, "docker-compose.yml")
+        open(comp, "w").write(COMPOSE_100.replace("    image: rpot:1.0.0\n    command: [\"console\"]",
+                                                  "    image: rpot:1.0.0-hotfix1\n    command: [\"console\"]"))
+
+        def broken(d):
+            return False
+        with self.mock.patch.object(self.r, "_detect_install", lambda: ("manager", self.d)):
+            msg = self.run_update(broken)
+        self.assertIn("runs 1.0.0 again (images rpot:1.0.0-hotfix1, rpot:1.0.0)", msg)
+
+    def test_unknown_image_tag_is_refused(self):
+        open(os.path.join(self.d, "docker-compose.yml"), "w").write("services:\n  console:\n    image: rpot:1.0.0-custom\n")
+        self.assertIsNone(self.r.installed_version(self.d))
+
+    def test_add_decoy_guard_still_holds(self):
+        """R4-L2 stays: only update itself passes guard=False."""
+        with self.stack() as s:
+            os.makedirs(self.broot, mode=0o700)
+            self.r.write_private(os.path.join(self.broot, "update-in-progress-manager.json"), "{}")
+            die = s.enter_context(self.mock.patch.object(self.r, "die", side_effect=SystemExit))
+            with self.assertRaises(SystemExit):
+                self.r._add_context(self.d, slots=False)
+        self.assertIn("did not finish", str(die.call_args))
+
+
+for _n in [n for n in dir(TestUpdateBackupAndRollback) if n.startswith("test_") and n not in TestUpdateEndToEnd.__dict__]:
+    setattr(TestUpdateEndToEnd, _n, None)              # reuse the harness, not the parent's tests (other fixtures)
+
+
+class TestSensorSetAccessAndJoinSecret(unittest.TestCase):
+    """QA vm2: S-1 set-access on a remote sensor printed an add-decoy message; J-1 the pasted join string was echoed."""
+
+    def test_set_access_on_a_sensor_says_what_to_do(self):
+        with tempfile.TemporaryDirectory() as d:
+            os.makedirs(os.path.join(d, "conf"))
+            open(os.path.join(d, "conf", "sensor.json"), "w").write("{}")
+            env = dict(os.environ, RPOT_TEST_IFACES=json.dumps(TWO), RPOT_TEST_SSH_IP="10.0.0.5",
+                       SSH_CONNECTION="10.99.0.7 50000 10.0.0.5 22")
+            p = subprocess.run([sys.executable, INSTALLER, "set-access", "--dry-run", "--yes", "--allow-ssh",
+                                "10.8.0.0/24", "--dir", d], capture_output=True, text=True, env=env, timeout=60)
+        out = ANSI.sub("", p.stdout + p.stderr)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("this server is a remote SENSOR. set-access changes the MANAGER's", out)
+        self.assertIn("host-SSH allow-list", out)
+        self.assertNotIn("To add a decoy", out)
+
+    def test_join_string_is_never_printed(self):
+        token = JOIN.split("/")[3].split("#")[0]
+        rc, out, _ = run([], THREE, "--yes", "--join", JOIN_FS, "--mgmt-if", "eth0", "--decoy-if", "eth2", mode="sensor")
+        self.assertEqual(rc, 0, out[-1500:])
+        self.assertIn("Join string: redpot://10.0.0.99:63462/… (hidden)", out)
+        self.assertNotIn(token, out)
+        self.assertNotIn("B6B6B6B6", out)                       # nor the fingerprint
+
+    def test_redact_and_secret_prompt(self):
+        from unittest import mock
+        r = _mod()
+        self.assertEqual(r.redact_join(JOIN), "redpot://10.0.0.99:63462/… (hidden)")
+        self.assertEqual(r.redact_join("garbage"), "(hidden)")
+        tty = mock.Mock()
+        tty.isatty.return_value = True
+        with mock.patch.object(r.sys, "stdin", tty), mock.patch("getpass.getpass", return_value=JOIN) as gp, \
+                mock.patch.object(r, "A", mock.Mock(yes=False)), mock.patch("builtins.print"):
+            self.assertEqual(r.ask("Join string", None, None, secret=r.redact_join), JOIN)
+        gp.assert_called_once()                                    # typed without echo on a terminal

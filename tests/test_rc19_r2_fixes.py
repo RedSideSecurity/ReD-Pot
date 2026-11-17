@@ -25,9 +25,11 @@ class FakeRun:
     def __init__(self, fail=lambda t: False):
         self.calls, self.fail = [], fail
 
-    def __call__(self, cmd, check=True, capture=False, quiet=False):
+    def __call__(self, cmd, check=True, capture=False, quiet=False, new_session=False):
         t = cmd if isinstance(cmd, str) else " ".join(cmd)
         self.calls.append(t)
+        if t.startswith("/bin/sh "):                     # RC-35 M2: firewall.sh always runs in its own session
+            assert new_session, t
         return subprocess.CompletedProcess(cmd, 1 if self.fail(t) else 0, "", "NOT in effect: ip6tables:INPUT->REDPOT-IN6")
 
 
@@ -78,8 +80,8 @@ class TestApplyFailClosed(unittest.TestCase):
 
     def test_previous_rules_restored(self):
         calls, msg = self.go(lambda t: t == f"/bin/sh {self.fw()} apply")
-        self.assertEqual(calls, [f"/bin/sh {self.fw()} apply", f"/bin/sh {self.fw()} remove",
-                                 f"/bin/sh {self.fw('firewall.sh.prev')} apply"])
+        # RC-35 M2: the running stack's rules are never stripped first (make-before-break: the old ones stay)
+        self.assertEqual(calls, [f"/bin/sh {self.fw()} apply", f"/bin/sh {self.fw('firewall.sh.prev')} apply"])
         self.assertIn("PREVIOUS firewall rules were put back", msg)
         self.assertIn("The change was NOT started", msg)
         self.assertIn("ip6tables:INPUT->REDPOT-IN6", msg)
@@ -87,25 +89,26 @@ class TestApplyFailClosed(unittest.TestCase):
 
     def test_previous_rules_fail_too_stack_stopped(self):
         calls, msg = self.go(lambda t: t.endswith(" apply"))
-        self.assertEqual(calls, [f"/bin/sh {self.fw()} apply", f"/bin/sh {self.fw()} remove",
-                                 f"/bin/sh {self.fw('firewall.sh.prev')} apply",
-                                 f"/bin/sh {self.fw('firewall.sh.prev')} remove", "systemctl stop redpot"])
+        # stop first, then take the rules out (M2)
+        self.assertEqual(calls, [f"/bin/sh {self.fw()} apply", f"/bin/sh {self.fw('firewall.sh.prev')} apply",
+                                 "systemctl stop redpot", f"/bin/sh {self.fw()} remove"])
         self.assertIn("previous rules could not be restored either", msg)
         self.assertIn("was STOPPED", msg)
 
     def test_no_previous_rules_stack_stopped(self):
         calls, msg = self.go(lambda t: t.endswith(" apply"), prev=None)
-        self.assertEqual(calls, [f"/bin/sh {self.fw()} apply", f"/bin/sh {self.fw()} remove", "systemctl stop redpot"])
+        self.assertEqual(calls, [f"/bin/sh {self.fw()} apply", "systemctl stop redpot", f"/bin/sh {self.fw()} remove"])
         self.assertIn("There were no previous rules", msg)
         self.assertIn("was STOPPED", msg)
 
     def test_systemctl_fails_compose_stop(self):
         calls, msg = self.go(lambda t: t.endswith(" apply") or t.startswith("systemctl stop"), prev=None)
-        self.assertEqual(calls[-1], f"cd {self.d} && docker compose -p redpot stop")
+        self.assertEqual(calls[-2:], [f"cd {self.d} && docker compose -p redpot stop", f"/bin/sh {self.fw()} remove"])
         self.assertIn("was STOPPED", msg)
         calls, msg = self.go(lambda t: t.endswith(" apply") or "stop" in t, prev=None)
         self.assertIn("could NOT be stopped", msg)
-        self.assertIn("WITHOUT its firewall", msg)
+        self.assertIn("its firewall is incomplete", msg)
+        self.assertNotIn(f"/bin/sh {self.fw()} remove", calls)       # not stopped: keep whatever rules are left
 
     def test_first_install_says_run_the_installer_again(self):
         calls, msg = self.go(lambda t: t.endswith(" apply"), prev=None, change=False)
@@ -138,7 +141,7 @@ class TestDecoyChangeFailClosed(unittest.TestCase):
                 return True
             seen = {}
 
-            def fake(cmd, check=True, capture=False, quiet=False):
+            def fake(cmd, check=True, capture=False, quiet=False, new_session=False):
                 t = cmd if isinstance(cmd, str) else " ".join(cmd)
                 if t.endswith("firewall.sh.prev apply"):
                     seen["prev"] = open(cmd[-2]).read()

@@ -1,11 +1,11 @@
 """Shared sensor runtime: context object, threaded TCP listener, TLS cert, safe paths."""
-import ipaddress
 import os
 import socket
 import threading
 import time
 
 from rpot.common.events import new_session
+from rpot.common.iputil import ip_obj
 
 
 def _pids_max(path="/sys/fs/cgroup/pids.max"):
@@ -927,6 +927,6 @@ def safe_join(root, *parts):
 
 def is_private(ip):
     try:
-        return ipaddress.ip_address(ip).is_private
-    except ValueError:
+        return ip_obj(ip).is_private
+    except (ValueError, AttributeError):
         return False

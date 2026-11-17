@@ -195,7 +195,10 @@ def cmd_init(a):
         print(f"    sensor   : {s['name']:<6} {roles[s['role']]['title']:<26} {s['ip']}"
               + (f" on {s['iface']}" if s.get("iface") else ""))
     print(f"    tokens   : {len(cfg['tokens'])} honeytokens planted")
-    print(f"    console  : {curl}  (UI token: {cfg['console']['admin_token']})")
+    if os.environ.get("RPOT_INSTALLER"):                # B3 (1.0.1): the installer summary prints the token ONCE
+        print(f"    console  : {curl}  (admin token: in the install summary and INSTALL-INFO.txt)")
+    else:
+        print(f"    console  : {curl}  (UI token: {cfg['console']['admin_token']})")
     if not os.environ.get("RPOT_INSTALLER"):            # the installer composes + starts everything itself
         print("    next     : rpotctl.py compose -d DIR && cd DIR && docker compose up -d")
 
@@ -385,7 +388,7 @@ def cmd_compose(a):
         for root, dirs, files in os.walk(d):
             for n in dirs + files:
                 try:
-                    os.chown(os.path.join(root, n), 10001, 10001)
+                    os.chown(os.path.join(root, n), 10001, 10001, follow_symlinks=False)   # never a link's target
                 except OSError:
                     pass
     print(f"[+] {p}")

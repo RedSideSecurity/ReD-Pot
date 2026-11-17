@@ -1,5 +1,114 @@
 # Changelog
 
+## 1.0.1 — Community Edition — 2026-11-16
+
+Bug-fix release from the 1.0.0 live test. No configuration or database change (`rpot.json` schema version 2).
+
+**Upgrading from 1.0.0:** in place, keeping persona, baits, admin token, enrolled sensors and the database: on the
+manager and on every remote sensor, `git pull` (or check out v1.0.1), then `sudo ./install.sh update` (`--yes` for
+unattended runs). See "Upgrading" in `docs/INSTALL.md`. Older versions (v0.3.x / v0.4.x): uninstall, then install.
+
+### Fixed
+- **Network map / console panels could fail with HTTP 500 and incoming events could be rejected under concurrent
+  load.** The console used one database connection for every thread, and the read paths (network map, world map,
+  summary, incidents ...) ran on it while events were being stored. Overlapping use broke statements
+  (`InterfaceError: bad parameter or other API misuse`), and an event batch answered with HTTP 500 could already be
+  partly stored, so the decoy's retry stored some events twice. A batch is now stored completely or not at all. Reads now use their own
+  read-only connection per thread (WAL: they see the last committed data and never block event storage); writes
+  keep the single connection under the lock. The network map and world map APIs also share one computation
+  between identical requests and reuse it for up to 5 s, so many open screens no longer pile up 24 h scans (their
+  time range is rounded up to the UI's presets: 15 min, 1 h, 24 h, 7 days, 30 days, 90 days).
+- **Network map: HTTP 500 "database or disk is full" on busy managers.** The 24 h network map sorted every event of
+  the range through an SQLite temp file (about 19 MB at 350k events a day), and the console's /tmp is a 16 MB tmpfs.
+  SQLite's temp files now go to the data volume (`SQLITE_TMPDIR=/var/lib/rpot/tmp`, the same as the 1.0.0 hotfix),
+  and the map query is bounded: the newest 20,000 source/decoy pairs, with a note when more exist; internal-only views
+  are filtered in the query itself.
+- **Attack map, "Live external activity" missed L4 events.** Internal sources were filtered out only after a 400-row
+  window, so a burst of internal traffic (a vulnerability scan, our own attack test) could empty the external feed even
+  right after an external L4. Internal and allow-listed sources are now left out before the limit. The newest 10 L4+
+  events of the range always stay in the 40-row feed, so internet scanner noise (L2/L3) no longer pushes an L4/L5
+  out. The feed follows the map's level selector (never below L2), and its caption shows the level. Its cost depends
+  on the feed size, not on the number of sources: events are read newest first in pages and the scan stops when the
+  feed is full or reaches the start of the time range (hard cap 25 000 rows per scan); source classification uses a
+  bounded LRU cache.
+- **IPv4-mapped IPv6 addresses** (`::ffff:192.168.1.10`, from a dual-stack socket) were classified as external and
+  never matched IPv4 entries of `allowlist`, `internal_nets`, `wall_allow` or the manager's decoy-network UI deny
+  list. They are now treated as the plain IPv4 address everywhere a source is classified, and stored as plain IPv4
+  (decoys send it that way, and the manager normalises incoming events and bait-document beacons too).
+- **Installer:** the admin token was printed twice at the end of a manager install (the `rpotctl init` line and the
+  summary). It is printed once, in the summary, and kept in `INSTALL-INFO.txt`. `rpotctl init` run by hand still
+  shows it.
+- **Remote sensor on DHCP locked out after an address change.** The decoy follows a new lease, the manager's
+  sensor-API allow-list did not, and there was no supported way to change it. The sensor installer now warns when
+  the manager link is a DHCP lease (static address or DHCP reservation needed; confirm, default no), the L4 "stopped
+  reporting" alert of a remote sensor points at the fix, and the new `install.sh set-access` changes the lists (see
+  *Added*).
+- **A clock jump on the manager raised false tamper alerts.** A forward step of the system clock (NTP after a snapshot
+  restore, `date -s`) opened an L4 "stopped reporting — possible tampering" incident for every decoy. Decoy silence is
+  now measured on the monotonic clock; a detected jump starts a grace period for decoys without a baseline and is
+  logged once on the console output. Admin sessions still end on a large forward jump (cookie expiry is wall-clock
+  time).
+
+### Fixed (security)
+- **Firewall apply had an open gap and could fail open.** `firewall.sh apply` removed every ReD-Pot chain first and
+  hooked the new ones only at the end, while the console and the decoys kept running; Ctrl-C or a dropped SSH session
+  during add-decoy / remove-decoy could leave them without rules. The rules are now swapped make-before-break: the
+  new generation of the chains is built next to the one in effect and hooked only when complete, then the old one is
+  removed; a failed build is dropped and the previous rules stay. After an interrupted run (even `kill -9`) the next
+  apply recognises the complete generation by checking every hook point, never by name. `apply` ignores
+  SIGHUP/SIGINT/SIGTERM; the installer ignores SIGINT/SIGHUP/SIGTERM from writing `firewall.sh` to applying it and
+  runs it in its own session; when even the previous rules cannot be restored the stack is stopped before the rules
+  are taken out, and a failed apply says so honestly when the host is not protected. ip6tables failures count only
+  where IPv6 is on. The same script runs at boot.
+- **Allow-lists widened silently.** A network with host bits set (`1.2.3.4/0`, `192.168.1.10/2`) was turned into its
+  network (`0.0.0.0/0` = anyone, `192.0.0.0/2`). Such input is now refused with the network and the single-address
+  form to type instead; interactive runs show the normalised list.
+- **`trust_xff`:** the bait-document beacon trusted `X-Forwarded-For` from any client and took its leftmost entry, so
+  a client could name an allow-listed address and mute the alert. It is now honoured only when the TCP peer is in
+  the new `console.trusted_proxies` list (empty = never, even with `trust_xff`), only its rightmost entry (the one
+  the proxy adds) is used, the proxy is recorded (`data.via_proxy`), and a source taken from it is never matched
+  against the allow-list. Off by default; the installer never sets it.
+- Allow-lists and ports read back from `installer.json` are validated again before they reach `firewall.sh`;
+  `installer.json` and `INSTALL-INFO.txt` are written atomically and never through a symlink.
+
+### Added
+- `sudo ./install.sh update`: in-place update of a manager or remote sensor (1.0.0 → 1.0.1, also from a 1.0.0
+  manager running the hotfix image `rpot:1.0.0-hotfix1`, which it supersedes). It refuses anything
+  but a supported version step of the Community Edition (and says "already up to date" on 1.0.1), makes a backup
+  first (database with the sqlite backup API, configuration, compose file, firewall.sh, unit, with owners and
+  modes; `/var/backups/redpot/<time>-<kind>-<version>/`, root only), gets the new image the normal way (verified
+  download or local build), rewrites compose, unit and firewall.sh (manager), restarts and checks that the console
+  answers and the decoys run. On any failure (any error, also a dropped SSH session) it restores the previous image,
+  configuration (owners and modes kept), unit and firewall rules, reports "rolled back" only once the service runs
+  again, and otherwise says exactly what is wrong. An update cut off by a power loss is offered for rollback on the
+  next run (`--resume-rollback` for unattended runs; refused if the files changed after it); until then add-decoy,
+  remove-decoy and set-access refuse. Uninstall removes the update backups (kept with `--keep-data`).
+  Signals are ignored during the critical part. The image now carries an `io.redside.edition` label.
+- `sudo ./install.sh set-access`: change the web UI, sensor API and host SSH allow-lists of a manager install
+  without reinstalling (persona, baits and admin token stay). Interactive with the current lists as defaults, or
+  `--yes --allow-sensor 192.168.1.0/24` (only the named lists change). It applies the install's exposure checks: on
+  an address a decoy shares, a list open to anyone or containing the decoy's own LAN is warned about and needs
+  confirmation (default no); with `--yes` it is refused unless `--accept-exposure` is given. It runs the firewall
+  preflight, rewrites `firewall.sh` and swaps the rules in (see above); if that fails, the previous `firewall.sh`
+  stays on disk and `installer.json` is unchanged. Your current SSH client always stays allowed; open web UI /
+  sensor API connections from removed addresses are cut when the `conntrack` tool is installed (otherwise they stay
+  until they close); host SSH sessions are never cut automatically; unchanged lists change nothing.
+- `set-access` warns when the new sensor-API list leaves out an enrolled remote sensor's address (it would be
+  refused and go offline); interactive runs ask to confirm (default no).
+- The remote-sensor relay logs one line (at most once a minute per kind) instead of full tracebacks while the
+  manager is unreachable.
+- `add-decoy` onto the management interface runs the same exposure checks (and needs `--accept-exposure` with
+  `--yes` for an exposed list).
+
+### Changed
+- **Installer, web UI allow-list:** when the web UI allow-list is restricted (interactive or `--yes`), the installer
+  warns that bait documents only report from addresses allowed to reach the console: the bait Word documents call
+  home to the web UI port. This is how the Community Edition works; README ("Community Edition limits") and
+  `docs/INSTALL.md` say the same. A separate beacon endpoint is planned for ReD-Pot Enterprise.
+- "Live external activity" caption shows the level filter and that the newest L4+ events are always kept.
+- Docs: remote sensors need a static address or a DHCP reservation; `set-access` in Day-2 operations and
+  Troubleshooting.
+
 ## 1.0.0 — Community Edition — 2026-11-13
 
 First release of **ReD-Pot Community Edition** (MIT), built from v0.4.0. It keeps every decoy role, the baits and

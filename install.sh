@@ -7,6 +7,9 @@
 #                                       never --join 'redpot://…' on the command line: ps shows it)
 #   sudo ./install.sh add-decoy           add one decoy (e.g. on a new interface) — keeps persona + baits
 #   sudo ./install.sh remove-decoy NAME   remove a decoy added earlier
+#   sudo ./install.sh update              in-place update of this manager / sensor (backup + rollback; --yes)
+#   sudo ./install.sh set-access          change the web UI / sensor API / host SSH allow-lists
+#                                      (unattended: --yes --allow-sensor 10.0.5.0/24 [--allow-ui …] [--allow-ssh …])
 #   sudo ./install.sh uninstall [--keep-data] [--purge-image]   (restores host SSH to 22)
 #   sudo ./install.sh reset-token [--wall] [--wall-allow 10.0.5.20,10.0.6.0/28]
 #                                      new admin token (+ new wall link, logs out all wall screens)

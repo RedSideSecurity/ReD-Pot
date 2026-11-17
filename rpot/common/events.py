@@ -25,6 +25,8 @@ import time
 import uuid
 from datetime import datetime, timezone
 
+from rpot.common.iputil import norm_ip
+
 
 def now_iso():
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
@@ -114,7 +116,7 @@ class Emitter:
     def emit(self, type_, src=None, dst_port=None, proto=None, session=None, **data):
         ev = {
             "ts": now_iso(), "sensor": self.sensor, "role": self.role, "sensor_ip": self.sensor_ip,
-            "src_ip": src[0] if src else None, "src_port": src[1] if src else None,
+            "src_ip": norm_ip(src[0]) if src else None, "src_port": src[1] if src else None,
             "dst_port": dst_port, "proto": proto, "type": type_, "session": session,
             "data": clean({k: v for k, v in data.items() if v is not None}),
         }

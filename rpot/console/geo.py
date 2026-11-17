@@ -7,11 +7,12 @@ Looks in RPOT_GEOIP_DIR (default /var/lib/rpot/geoip) for:
 Any MaxMind-compatible GeoLite2-City/Country/ASN .mmdb works too.
 """
 import glob
-import ipaddress
 import json
 import os
 import threading
 from functools import lru_cache
+
+from rpot.common.iputil import ip_obj
 
 try:
     import maxminddb
@@ -63,12 +64,10 @@ class Geo:
 
     @lru_cache(maxsize=50000)
     def lookup(self, ip):
-        try:
-            a = ipaddress.ip_address(ip)
-        except ValueError:
+        a = ip_obj(ip)                 # ::ffff:a.b.c.d is looked up as a.b.c.d
+        if a is None or not a.is_global:
             return None
-        if not a.is_global:
-            return None
+        ip = str(a)
         out = {}
         with self.lock:
             rec = None

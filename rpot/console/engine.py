@@ -4,19 +4,23 @@ host attribution and query helpers for the UI/API.
 Alerts never leave the manager: each one is a line in alerts.json (if enabled) and a row in the
 alert_records table (the source for Export). There is no outbound delivery of any kind."""
 import ipaddress
+import os
 import json
 import re
 import socket
 import sqlite3
 import threading
 import time
+from collections import OrderedDict
 from datetime import datetime, timedelta, timezone
 
 from rpot.console.scoring import Scorer, score, describe, top_holders, LEVEL_NAMES
 from rpot.console.geo import Geo
 from rpot.console.logfile import JsonlLog
 from rpot.console.fleet import Fleet
+from rpot.console.dbconn import SharedDB
 from rpot.common.edition import MAX_DECOYS
+from rpot.common.iputil import ip_obj, norm_ip
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS events(
@@ -138,6 +142,16 @@ class Engine:
         self.db.executescript(SCHEMA)
         self._migrate()
         self.lock = threading.RLock()
+        # B7 (1.0.1): every thread used this one connection; reads now use per-thread read-only connections (WAL),
+        # everything else runs on it under self.lock (rpot/console/dbconn.py). Fleet gets the same wrapper.
+        self.db = SharedDB(self.db, self.lock, db_path)
+        tmpd = os.environ.get("SQLITE_TMPDIR")   # B8: the image points SQLite's temp files at the data volume
+        if tmpd:
+            try:
+                os.makedirs(tmpd, mode=0o700, exist_ok=True)
+            except OSError as e:
+                print(f"[ReD-Pot manager] WARNING: SQLITE_TMPDIR {tmpd} cannot be created ({e}); big queries may fail",
+                      flush=True)
         self.scorer = Scorer()
         self._skew_warned = set()
         self._gap_state = {}            # decoy name -> [monotonic start, events.id, undelivered sum, first, last, reports]
@@ -150,6 +164,9 @@ class Engine:
         self.event_log = JsonlLog(ldir, "events", lc.get("max_mb", 50), lc.get("keep", 90)) if ldir and lc.get("events", False) else None
         self.allow = [ipaddress.ip_network(c, strict=False) for c in cfg.get("allowlist", [])]
         self.internal = [ipaddress.ip_network(c, strict=False) for c in cfg.get("internal_nets", [])]
+        self._memo_lock, self._memo, self._flight = threading.Lock(), {}, {}   # API result cache (memo)
+        self._int_lock = threading.Lock()   # is_internal LRU (created here: no first-call race between threads)
+        self._int_nets, self._int_cache = tuple(self.internal), OrderedDict()
         self.fleet = Fleet(cfg, self.db, self.lock)
         self.db.executescript(ce_limit_sql())
         self.db.execute("INSERT OR REPLACE INTO ce_local(id, n) VALUES(1, ?)", (len(self.fleet.local_names()),))
@@ -159,6 +176,8 @@ class Engine:
         self._offline = {r[0][7:] for r in self.db.execute(
             "SELECT i.subject FROM incidents i WHERE i.subject LIKE 'sensor:%' AND i.status IN ('open','ack') AND "
             "(SELECT e.type FROM events e WHERE e.incident_id = i.id ORDER BY e.id DESC LIMIT 1) = 'sensor.offline'")}
+        self._seen_mono = {}            # decoy name -> time.monotonic() of its last report (B6: silence ignores clock jumps)
+        self._wd_clock = (time.time(), time.monotonic())   # (wall s, monotonic s) of the watchdog's previous check
         if cfg.get("console", {}).get("watch_offline", True):
             threading.Thread(target=self._watch_sensors, daemon=True, name="sensor-watch").start()
             threading.Thread(target=self._retention, daemon=True, name="retention").start()
@@ -183,7 +202,7 @@ class Engine:
                 for ev in events:
                     n += self._one(ev)
                 self.db.execute("COMMIT")
-            except Exception:
+            except BaseException:               # final review: also KeyboardInterrupt / SystemExit → roll back, re-raise
                 self.db.execute("ROLLBACK")
                 self._gap_state = {}        # may point at rolled-back sensor.gap rows
                 self._pending_lines = []    # their alert_records rows were rolled back too
@@ -206,6 +225,9 @@ class Engine:
         for k in ("src_ip", "sensor_ip", "proto", "session", "role"):
             if ev.get(k) is not None and not isinstance(ev[k], str):
                 ev[k] = str(ev[k])[:64]
+        for k in ("src_ip", "sensor_ip"):           # ::ffff:a.b.c.d (dual-stack socket) → a.b.c.d, stored plain
+            if ev.get(k):
+                ev[k] = norm_ip(ev[k])
         for k in ("src_port", "dst_port"):
             if ev.get(k) is not None and not isinstance(ev[k], int):
                 ev[k] = None
@@ -234,9 +256,11 @@ class Engine:
             ev.setdefault("data", {})["via"] = ev.get("sensor")
             ev["sensor"] = "CANARY"
         out = [ev] + (self.scorer.escalations(ev) if src else [])
+        # re-review R2-L4: a source taken from X-Forwarded-For is a claim, not a TCP peer — never allow-listed
+        via_proxy = ev.get("src_via_proxy") is True
         for e in out:
             lvl = score(e)
-            allow = 1 if src and self._allowed(src) else 0
+            allow = 1 if src and not via_proxy and self._allowed(src) else 0
             inc = None
             if src and not allow and lvl >= 1:
                 inc = self._incident(e, lvl)
@@ -259,9 +283,8 @@ class Engine:
              json.dumps(ev.get("data") or {}, ensure_ascii=False), inc, allow))
 
     def _allowed(self, ip):
-        try:
-            a = ipaddress.ip_address(ip)
-        except ValueError:
+        a = ip_obj(ip)
+        if a is None:
             return False
         return any(a in n for n in self.allow)
 
@@ -270,18 +293,34 @@ class Engine:
 
     def is_internal(self, ip):
         """Private / CGNAT / link-local are ALWAYS internal; internal_nets adds the organisation's
-        own public ranges (it never removes the private ones)."""
-        try:
-            a = ipaddress.ip_address(ip)
-        except ValueError:
-            return False
-        return any(a in n for n in self.ALWAYS_INTERNAL) or any(a in n for n in self.internal)
+        own public ranges (it never removes the private ones). IPv4-mapped IPv6 is classified as IPv4.
+        Results are kept in a bounded LRU (INT_CACHE entries, least recently used evicted first); it is emptied only
+        when internal_nets itself changes."""
+        nets = tuple(self.internal)
+        with self._int_lock:
+            if self._int_nets != nets:
+                self._int_nets, self._int_cache = nets, OrderedDict()
+            hit = self._int_cache.get(ip)
+            if hit is not None:
+                self._int_cache.move_to_end(ip)
+                return hit
+        a = ip_obj(ip)
+        v = a is not None and (any(a in n for n in self.ALWAYS_INTERNAL) or any(a in n for n in nets))
+        if isinstance(ip, str):
+            with self._int_lock:
+                self._int_cache[ip] = v
+                while len(self._int_cache) > self.INT_CACHE:
+                    self._int_cache.popitem(last=False)
+        return v
+
+    INT_CACHE = 50000
 
     def _sensor_status(self, ev):
         d = ev.get("data") or {}
         name = ev.get("sensor")
         self.db.execute("INSERT OR IGNORE INTO sensors(name, role, ip) VALUES(?,?,?)", (name, ev.get("role"), ev.get("sensor_ip")))
         self.db.execute("UPDATE sensors SET last_seen=?, role=COALESCE(role, ?) WHERE name=?", (ev["ts"], ev.get("role"), name))
+        self._seen_mono[name] = time.monotonic()
         if ev["type"] == "sensor.start":
             self.db.execute("UPDATE sensors SET version=?, services=?, os=?, title=?, started=?, health=NULL WHERE name=?",
                             (d.get("version"), json.dumps(d.get("services") or []), d.get("os"), d.get("title"), ev["ts"], name))
@@ -476,19 +515,52 @@ class Engine:
         while True:
             time.sleep(every)
             try:
-                now = datetime.now(timezone.utc)
-                for s in self.sensors():
-                    if not s.get("last_seen"):
-                        continue
-                    silent = (now - parse_ts(s["last_seen"])).total_seconds()
-                    if silent > grace and s["name"] not in self._offline:
-                        self._offline.add(s["name"])
-                        self._sensor_alert(s, "sensor.offline", f"Sensor {s['name']} stopped reporting {int(silent)} s ago — possible tampering")
-                    elif silent <= grace and s["name"] in self._offline:
-                        self._offline.discard(s["name"])
-                        self._sensor_alert(s, "sensor.online", f"Sensor {s['name']} is reporting again")
+                self._check_sensors(grace=grace)
             except Exception:
                 pass
+
+    CLOCK_JUMP = 60     # s: wall clock and monotonic clock disagree by more than this between two checks = a jump
+
+    def _check_sensors(self, now=None, mono=None, grace=120):
+        """One watchdog pass. B6 (1.0.1): silence is measured on the MONOTONIC clock (time since the decoy's last
+        report as seen by this process), so a wall-clock jump (NTP step after a snapshot restore, `date -s`, RTC
+        fault) never looks like every decoy going silent at once. A decoy not seen since this process started gets
+        its baseline from the stored last_seen (wall clock) once; when a jump is detected that baseline restarts
+        now (grace period). The jump itself is logged once on the console output."""
+        now = now or datetime.now(timezone.utc)
+        mono = time.monotonic() if mono is None else mono
+        wall = now.timestamp()
+        jump = 0.0
+        if self._wd_clock is not None:
+            jump = (wall - self._wd_clock[0]) - (mono - self._wd_clock[1])
+        self._wd_clock = (wall, mono)
+        jumped = abs(jump) > self.CLOCK_JUMP
+        if jumped:
+            print(f"[ReD-Pot manager] system clock jumped {'forward' if jump > 0 else 'back'} by {abs(int(jump))} s; "
+                  "decoy silence is measured on the monotonic clock, so no tamper alerts are raised for the jump",
+                  flush=True)
+        for s in self.sensors():
+            if not s.get("last_seen"):
+                continue
+            name = s["name"]
+            if name not in self._seen_mono:
+                if jumped:
+                    self._seen_mono[name] = mono                      # restart the baseline: grace from now
+                else:
+                    wall_silent = max(0.0, (now - parse_ts(s["last_seen"])).total_seconds())
+                    self._seen_mono[name] = mono - wall_silent
+            silent = mono - self._seen_mono[name]
+            if silent > grace and name not in self._offline:
+                self._offline.add(name)
+                hint = ""
+                if name not in self.fleet.local_names():     # B5: a remote sensor on DHCP may just have a new address
+                    hint = (" (remote sensor: if its address changed, e.g. a new DHCP lease, the manager's sensor-API "
+                            "allow-list refuses it; allow the new address with: sudo ./install.sh set-access)")
+                self._sensor_alert(s, "sensor.offline",
+                                   f"Sensor {name} stopped reporting {int(silent)} s ago — possible tampering{hint}")
+            elif silent <= grace and name in self._offline:
+                self._offline.discard(name)
+                self._sensor_alert(s, "sensor.online", f"Sensor {name} is reporting again")
 
     def _sensor_alert(self, s, type_, summary):
         ev = {"ts": iso(datetime.now(timezone.utc)), "sensor": s["name"], "role": s.get("role"), "sensor_ip": s.get("ip"),
@@ -865,6 +937,83 @@ class Engine:
             "WHERE src_ip=? AND ts>=? AND sensor IS NOT NULL GROUP BY sensor ORDER BY first", (ip, self._since(hours))).fetchall()
         return [dict(r) for r in rows]
 
+    MEMO_TTL = 5.0      # s: the dashboard / wall refresh interval
+    MEMO_MAX = 64       # cached results at most (final review R3-L3)
+
+    def memo(self, key, fn, ttl=None):
+        """B7 follow-up (client: /api/graph 24 h): the network-map and world-map aggregates read the whole time range
+        (a 24 h GROUP BY, ~0.7 s on the client's 353k events/day) and every open browser / wall screen asks for them
+        every 5 s; slow calls piled up. For the HTTP API only: identical requests in flight share ONE computation
+        (single flight) and a result is reused for up to MEMO_TTL s. Callers get a shallow copy (the API may replace
+        top-level keys, e.g. the kiosk view). Engine methods themselves are never cached."""
+        ttl = self.MEMO_TTL if ttl is None else ttl
+        with self._memo_lock:
+            hit = self._memo.get(key)
+            if hit and hit[0] > time.monotonic():
+                return dict(hit[1])
+            ent = self._flight.get(key)
+            if ent is None:
+                ent = self._flight[key] = [threading.Lock(), 0]
+            ent[1] += 1                            # final review R3-L3: refcounted, removed when nobody waits
+        try:
+            with ent[0]:
+                with self._memo_lock:
+                    hit = self._memo.get(key)
+                    if hit and hit[0] > time.monotonic():
+                        return dict(hit[1])
+                v = fn()
+                with self._memo_lock:
+                    now = time.monotonic()
+                    self._memo = {k: x for k, x in self._memo.items() if x[0] > now}
+                    self._memo[key] = (now + ttl, v)
+                    while len(self._memo) > self.MEMO_MAX:           # cap: drop the entry that expires first
+                        del self._memo[min(self._memo, key=lambda k: self._memo[k][0])]
+            return dict(v)
+        finally:
+            with self._memo_lock:
+                ent[1] -= 1
+                if ent[1] == 0 and self._flight.get(key) is ent:
+                    del self._flight[key]
+
+    GRAPH_MAX_GROUPS = 20000    # (source, decoy) pairs kept per network-map request (final review R4-L1)
+
+    def _internal_globs(self):
+        """GLOB patterns that COVER every internal network (each widened to whole octets: 172.16.0.0/12 → '172.*'),
+        for a cheap SQL pre-filter of scope=internal; is_internal() then decides exactly on the few groups left.
+        None = not expressible (an IPv6 internal_nets entry): no SQL pre-filter."""
+        pats = ["fc*", "fd*", "fe8*", "fe9*", "fea*", "feb*"]           # fc00::/7, fe80::/10 (ALWAYS_INTERNAL)
+        for n in self.ALWAYS_INTERNAL + list(self.internal):
+            if n.version == 6:
+                if n in self.ALWAYS_INTERNAL:
+                    continue
+                return None
+            k = n.prefixlen // 8
+            octets = str(n.network_address).split(".")[:k]
+            pats.append(".".join(octets) + ("" if k == 4 else ("." if k else "") + "*"))
+        return list(dict.fromkeys(pats))
+
+    def _graph_edges(self, since, min_level, scope="all"):
+        """Host→decoy aggregates of the range (P-1, 1.0.1): one SQL GROUP BY, the shape of the 1.0.0 hotfix, which
+        is several times faster than aggregating in Python (QA vm1: 2.96 s → hotfix-like timings). Its sort spills to
+        SQLITE_TMPDIR on the data volume (B8), never the 16 MB /tmp tmpfs. Bounded (R4-L1): at most GRAPH_MAX_GROUPS
+        pairs, the newest first (ORDER BY last DESC LIMIT), `truncated` when more exist; scope=internal is pre-filtered
+        in SQL (_internal_globs) and decided exactly by is_internal() on the groups. Returns (rows, truncated)."""
+        where, args = "", [since]
+        globs = self._internal_globs() if scope == "internal" else None
+        if globs:
+            where = " AND (" + " OR ".join("src_ip GLOB ?" for _ in globs) + ")"
+            args += globs
+        rows = self.db.execute(
+            "SELECT src_ip, sensor, MAX(level) lvl, COUNT(*) n, GROUP_CONCAT(DISTINCT proto) protos, MIN(ts) first, "
+            "MAX(ts) last FROM events WHERE ts>=? AND src_ip IS NOT NULL AND sensor IS NOT NULL AND allowlisted=0"
+            + where + " GROUP BY src_ip, sensor HAVING lvl>=? ORDER BY last DESC LIMIT ?",
+            args + [min_level, self.GRAPH_MAX_GROUPS + 1]).fetchall()
+        truncated = len(rows) > self.GRAPH_MAX_GROUPS
+        rows = rows[:self.GRAPH_MAX_GROUPS]
+        if scope == "internal":
+            rows = [r for r in rows if self.is_internal(r["src_ip"])]
+        return rows, truncated
+
     def graph(self, hours=24, min_level=1, scope="internal"):
         """Nodes: subnets, hosts, sensors (+ Internet cluster). Edges: host→sensor (max level, count, protos)."""
         s = self._since(hours)
@@ -872,14 +1021,9 @@ class Engine:
         for x in self.sensors():
             nodes.append({"id": "s:" + x["name"], "kind": "sensor", "label": x["name"], "ip": x["ip"], "role": x["role"],
                           "title": x.get("title") or x["role"], "online": x["online"]})
-        rows = self.db.execute(
-            "SELECT src_ip, sensor, MAX(level) lvl, COUNT(*) n, GROUP_CONCAT(DISTINCT proto) protos, MIN(ts) first, MAX(ts) last "
-            "FROM events WHERE ts>=? AND src_ip IS NOT NULL AND sensor IS NOT NULL AND allowlisted=0 "
-            "GROUP BY src_ip, sensor HAVING lvl>=?", (s, min_level)).fetchall()
+        rows, truncated = self._graph_edges(s, min_level, scope)
         hosts, subnets = {}, {}
         known = {n["id"] for n in nodes}
-        if scope == "internal":
-            rows = [r for r in rows if self.is_internal(r["src_ip"])]
         for r in rows:
             if "s:" + r["sensor"] not in known:
                 known.add("s:" + r["sensor"])
@@ -902,7 +1046,8 @@ class Engine:
         for h in hosts.values():
             nodes.append(h)
             edges.append({"from": "n:" + h["subnet"], "to": h["id"], "kind": "member"})
-        return {"nodes": nodes, "edges": edges, "hours": hours, "now": iso(datetime.now(timezone.utc))}
+        return {"nodes": nodes, "edges": edges, "hours": hours, "now": iso(datetime.now(timezone.utc)),
+                "truncated": truncated}
 
     def worldmap(self, hours=24, min_level=1):
         """Public (non-internal) sources with GeoIP, for the T-Pot-style world attack map."""
@@ -928,23 +1073,85 @@ class Engine:
             if g.get("org"):
                 o = orgs.setdefault(g["org"], {"org": g["org"], "asn": g.get("asn"), "ips": 0, "events": 0})
                 o["ips"] += 1; o["events"] += r["n"]
-        feed = []
-        for e in self.db.execute(
-                "SELECT * FROM events WHERE ts>=? AND src_ip IS NOT NULL AND level>=2 AND allowlisted=0 ORDER BY id DESC LIMIT 400", (s,)):
-            if self.is_internal(e["src_ip"]):
-                continue
-            d = dict(e); d["data"] = json.loads(d["data"] or "{}"); d["desc"] = describe(d)
-            g = self.geo.lookup(d["src_ip"]) or {}
-            d["cc"], d["country"] = g.get("cc"), g.get("country")
-            feed.append(d)
-            if len(feed) >= 40:
-                break
+        feed = self._worldmap_feed(s, min_level)
         site = self.site_place()
         return {"hours": hours, "now": iso(datetime.now(timezone.utc)), "points": points, "nogeo": nogeo, "geo_sources": self.geo.sources,
                 "notice": self._worldmap_notice(points, s),
                 "countries": sorted(countries.values(), key=lambda c: -c["events"])[:15],
                 "orgs": sorted(orgs.values(), key=lambda o: -o["events"])[:10], "feed": feed,
+                "feed_level": max(2, int(min_level or 0)),
                 "site": site, "sensors": self.sensor_places(site)}
+
+    FEED_PAGE = 500         # rows per page of the feed scan
+    FEED_SCAN_MAX = 25000   # hard cap of rows read per feed scan (each 5 s refresh runs at most two scans)
+
+    def _range_start_id(self, since):
+        """Re-review R2-L2 / final review R3-L2: the lowest id of any event in the time range, so a feed scan that
+        finds fewer rows than it wants stops there instead of walking the whole table. MIN(id) over the ts index
+        range (index-only, no table rows): a late event with an older timestamp (a sensor minutes behind) can no
+        longer move the bound up and hide the rows stored before it."""
+        r = self.db.execute("SELECT MIN(id) FROM events INDEXED BY ev_ts WHERE ts>=?", (since,)).fetchone()
+        return r[0] if r and r[0] is not None else None
+
+    def _scan_external(self, since, level, want, lo_id=None):
+        """The newest `want` events (level >= `level`, not allow-listed) from external sources, newest first.
+        Visits only ids in [lo_id, newest] (primary-key range), at most FEED_SCAN_MAX rows."""
+        if lo_id is None:
+            lo_id = self._range_start_id(since)
+            if lo_id is None:
+                return []
+        out, last, scanned = [], None, 0
+        while len(out) < want and scanned < self.FEED_SCAN_MAX:
+            args = [lo_id, since, level] + ([last] if last is not None else []) + \
+                [min(self.FEED_PAGE, self.FEED_SCAN_MAX - scanned)]
+            page = self.db.execute(
+                "SELECT * FROM events WHERE id>=? AND ts>=? AND level>=? AND allowlisted=0 AND src_ip IS NOT NULL"
+                + (" AND id<?" if last is not None else "") + " ORDER BY id DESC LIMIT ?", args).fetchall()
+            if not page:
+                break
+            scanned += len(page)
+            last = page[-1]["id"]
+            for r in page:
+                if not self.is_internal(r["src_ip"]):
+                    out.append(r)
+                    if len(out) >= want:
+                        break
+        return out
+
+    FEED_SIZE = 40          # rows in "Live external activity"
+    FEED_HIGH = 10          # of which reserved for the newest L4+ events (never pushed out by L2/L3 noise)
+
+    def _worldmap_feed(self, since, min_level=1):
+        """"Live external activity": the newest events from PUBLIC sources, newest first (B2, 1.0.1).
+
+        - Internal sources are filtered out BEFORE the limit (paged scan below): internal noise can no longer use up
+          a fixed window and empty the feed.
+        - The map's level selector applies (never below L2: L1 is bare connection noise).
+        - The newest FEED_HIGH L4+ events are always kept; the rest of the FEED_SIZE rows are the newest events
+          of any level, so a burst of L2/L3 scanner traffic does not push an L4/L5 out.
+        Cost (security review L4): bounded by the feed, not by the number of sources. Events are read newest first
+        in pages of FEED_PAGE rows (primary-key order) and the scan stops as soon as the feed is full, or after
+        FEED_SCAN_MAX rows (a hard cap per scan: an internal flood larger than that can still hide older external
+        rows of that level, but never makes a refresh expensive). The L4+ reserve has its own scan, so L2/L3 noise
+        cannot use up its budget. Sources are classified through the is_internal LRU."""
+        lo = max(2, int(min_level or 0))
+        lo_id = self._range_start_id(since)
+        if lo_id is None:
+            return []
+        rows = {r["id"]: r for r in self._scan_external(since, lo, self.FEED_SIZE, lo_id)}
+        if lo < 4:
+            high = self._scan_external(since, 4, self.FEED_HIGH, lo_id)
+            if any(r["id"] not in rows for r in high):
+                keep = {r["id"] for r in high}
+                rest = [i for i in sorted(rows, reverse=True) if i not in keep][:self.FEED_SIZE - len(keep)]
+                rows = {r["id"]: r for r in high} | {i: rows[i] for i in rest}
+        feed = []
+        for i in sorted(rows, reverse=True):
+            d = dict(rows[i]); d["data"] = json.loads(d["data"] or "{}"); d["desc"] = describe(d)
+            g = self.geo.lookup(d["src_ip"]) or {}
+            d["cc"], d["country"] = g.get("cc"), g.get("country")
+            feed.append(d)
+        return feed
 
     def site_place(self):
         """Where the protected network is: `rpotctl.py site` if set, else the GeoIP of the manager's public_ip,

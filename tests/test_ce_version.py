@@ -1,4 +1,4 @@
-"""CE 1.0.0: single version source (rpot/__init__.py) and the edition module."""
+"""CE 1.0.x: single version source (rpot/__init__.py) and the edition module."""
 import os
 import subprocess
 import sys
@@ -18,12 +18,12 @@ from rpot.common import edition  # noqa: E402
 
 class TestVersion(unittest.TestCase):
     def test_single_source(self):
-        self.assertEqual(rpot.VERSION, "1.0.0")
+        self.assertEqual(rpot.VERSION, "1.0.1")      # the release this tree is (bump with rpot/__init__.py)
 
     def test_installer_image_derived_from_package(self):
         self.assertEqual(R.VERSION, rpot.VERSION)
-        self.assertEqual(R.IMAGE, "rpot:1.0.0")
-        self.assertEqual(R.REGISTRY_IMAGE, "ghcr.io/redsidesecurity/red-pot:1.0.0")
+        self.assertEqual(R.IMAGE, f"rpot:{rpot.VERSION}")
+        self.assertEqual(R.REGISTRY_IMAGE, f"ghcr.io/redsidesecurity/red-pot:{rpot.VERSION}")
 
     def test_installer_reads_version_as_text(self):
         with tempfile.TemporaryDirectory() as d:
@@ -43,7 +43,7 @@ class TestVersion(unittest.TestCase):
         p = subprocess.run([sys.executable, "-I", "-c", code, os.path.join(REPO, "installer")],
                            capture_output=True, text=True, timeout=60)
         self.assertEqual(p.returncode, 0, p.stderr)
-        self.assertEqual(p.stdout.strip(), "rpot:1.0.0")
+        self.assertEqual(p.stdout.strip(), f"rpot:{rpot.VERSION}")
 
     def test_ensure_image_build_passes_version_build_arg(self):
         calls = []
@@ -59,8 +59,8 @@ class TestVersion(unittest.TestCase):
         build = [c for c in calls if c[:2] == ["docker", "build"]]
         self.assertEqual(len(build), 1)
         cmd = build[0]
-        self.assertIn("VERSION=1.0.0", [cmd[i + 1] for i, a in enumerate(cmd) if a == "--build-arg"])
-        self.assertEqual(cmd[cmd.index("-t") + 1], "rpot:1.0.0")
+        self.assertIn(f"VERSION={rpot.VERSION}", [cmd[i + 1] for i, a in enumerate(cmd) if a == "--build-arg"])
+        self.assertEqual(cmd[cmd.index("-t") + 1], f"rpot:{rpot.VERSION}")
 
     def test_dockerfile_declares_version_arg(self):
         with open(os.path.join(REPO, "Dockerfile")) as f:
@@ -68,7 +68,7 @@ class TestVersion(unittest.TestCase):
 
     def test_rpotctl_image_defaults(self):
         import rpotctl
-        self.assertEqual(rpotctl.compose_text.__defaults__[0], "rpot:1.0.0")
+        self.assertEqual(rpotctl.compose_text.__defaults__[0], f"rpot:{rpot.VERSION}")
         with open(os.path.join(REPO, "rpotctl.py")) as f:
             src = f.read()
         self.assertNotRegex(src, r'"rpot:\d')

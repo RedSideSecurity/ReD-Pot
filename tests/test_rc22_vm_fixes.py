@@ -38,9 +38,11 @@ def apply_commands(txt):
 
 
 def check_commands(txt):
+    """check()'s -C probes of the generation apply() builds on a fresh host (REDPOT-*). The -B alternatives are the
+    other generation of the make-before-break swap (RC-35 M2) and do not exist after one apply."""
     body = txt.split("\ncheck() {", 1)[1].split("\n}\n", 1)[0]
     return [("iptables" if t == "IPT" else "ip6tables", shlex.split(a))
-            for t, a in re.findall(r"\$(IPT|IP6T) (-C [^2;|]*?)\s*2>", body)]
+            for t, a in re.findall(r"\$(IPT|IP6T) (-C [^2;|]*?)\s*2>", body) if not a.rstrip().endswith("-B")]
 
 
 TOLERATED = (["-N", "DOCKER-USER"],)            # '2>/dev/null' in the script: exists already with Docker's backend

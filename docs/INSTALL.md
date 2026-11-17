@@ -1,6 +1,6 @@
 # Installing and running ReD-Pot
 
-This guide covers ReD-Pot Community Edition 1.0.0 from a fresh server to day-2 operations. If you only want the short
+This guide covers ReD-Pot Community Edition 1.0.1 from a fresh server to day-2 operations. If you only want the short
 version, see [Quick start in the README](../README.md#quick-start).
 
 - [1. What you need](#1-what-you-need)
@@ -85,14 +85,14 @@ cd ReD-Pot
 sudo ./install.sh            # choose [1] Manager + decoys
 ```
 
-The installer **downloads the prebuilt image** `ghcr.io/redsidesecurity/red-pot:1.0.0` and checks that it was built
+The installer **downloads the prebuilt image** `ghcr.io/redsidesecurity/red-pot:1.0.1` and checks that it was built
 from exactly the code you cloned (SHA-256 label). If the check fails, you changed the code, or there is no internet, it
-builds the image `rpot:1.0.0` locally instead (a few minutes). Force a local build with `--build`.
+builds the image `rpot:1.0.1` locally instead (a few minutes). Force a local build with `--build`.
 
 The prebuilt image (linux/amd64 and linux/arm64) is built and published only by the release workflow
 (`.github/workflows/release.yml`) from the tagged commit, after the full test suite passes. Its source-hash label is
 computed with the installer's own `src_hash()`, so a clean clone of the same tag always matches. To check where an
-image came from: `gh attestation verify oci://ghcr.io/redsidesecurity/red-pot:1.0.0 --repo RedSideSecurity/ReD-Pot`.
+image came from: `gh attestation verify oci://ghcr.io/redsidesecurity/red-pot:1.0.1 --repo RedSideSecurity/ReD-Pot`.
 
 The wizard has 5 steps and a review screen. Type `back` at any question to return to the previous step;
 nothing is changed until you press Enter on the review screen. `Ctrl+C` quits without changes.
@@ -103,7 +103,13 @@ nothing is changed until you press Enter on the review screen. `Ctrl+C` quits wi
 | 2 Your company | AD/DNS domain (for example `corp.example.com`), industry (bank, hotel, government, IT, generic) | company name, NetBIOS name and mail domain are derived from the domain and shown right away; users come from a built-in pool, random per install. There is no default domain |
 | 3 Decoy servers | which roles: `1`, `1,3` or `none` | at most 3, and at most one per usable interface. `none` = a manager that only collects remote sensors |
 | 4 Decoy interfaces and names | per decoy: interface (an interface already used by an earlier decoy is not offered), host name, and the front page for the web decoy (webmail, helpdesk, intranet) | the decoy answers on the interface's own IP; there is no address question. Host names 1–15 chars (Windows limit). Other services on that address are listed and can be stopped |
-| 5 Access | static public IP (or `no`), GeoIP download, and **who may reach the web UI, the sensor API and host SSH** (three lists, `0.0.0.0/0` = anyone) | for everyone else the ports look **closed** (TCP reset, like any closed port). Your current SSH client is always allowed on the management interface (an IPv6 client too). When a decoy shares the management interface, all three lists default to your own SSH client address |
+| 5 Access | static public IP (or `no`), GeoIP download, and **who may reach the web UI, the sensor API and host SSH** (three lists, `0.0.0.0/0` = anyone) | for everyone else the ports look **closed** (TCP reset, like any closed port). Your current SSH client is always allowed on the management interface (an IPv6 client too). When a decoy shares the management interface, all three lists default to your own SSH client address. **Bait documents:** see the note below the table |
+
+> **Bait documents and the web UI allow-list (Community Edition).** The bait Word documents call home to the manager's
+> web UI port. Bait documents only report from addresses allowed to reach the console: with a restricted web UI
+> allow-list, a bait document opened on any other host (for example an attacker's workstation) is **not** reported.
+> The installer prints this warning when you restrict the web UI list, with `--yes` too. Bait files, credentials and
+> keys used against the decoys report as usual. A separate beacon endpoint is planned for ReD-Pot Enterprise.
 
 On the review screen type `1`–`5` to change a part, `q` to quit, or press **Enter** to install. The review shows the
 derived company / NetBIOS / mail domain, how many of the 3 decoy slots the install uses, each decoy's interface and IP,
@@ -111,7 +117,7 @@ the firewall plan and what happens to host SSH. When a decoy shares the manageme
 lists the host services that listen on that interface today (other than host SSH) and become unreachable there, for
 example a VPN server, and asks you to confirm (default: no). The installer then:
 
-1. installs Docker if needed and gets the `1.0.0` image (download or local build, see above),
+1. installs Docker if needed and gets the `1.0.1` image (download or local build, see above),
 2. generates the persona, the baits and honeytokens, and a new **TLS certificate** for the manager (looks like the company's internal PKI: `CN=<host>.<domain>`, issuer "<Company> Issuing CA"),
 3. starts the manager and the decoys and installs the **`redpot` systemd service** (starts on boot),
 4. if a decoy shares the management interface, moves host SSH to a random port. It listens on the new port first and
@@ -129,6 +135,8 @@ example a VPN server, and asks you to confirm (default: no). The installer then:
   ICMP port unreachable), on IPv6 too, and the interface answers ARP only for its own address. This hides **all other
   host services** on that interface, including the management interface when a decoy shares it.
 - The web UI, the sensor API and host SSH answer only on the management interface, and only to their allow-lists.
+  The bait-document beacons use the web UI port, so they reach the manager only from the web UI allow-list (see the
+  note under the *5 Access* step).
 - The server never routes for a decoy LAN: forwarded traffic that arrives on a decoy interface (other than the
   management one) is refused, and traffic into a Docker network is accepted only for published ports. A route to the
   console container's own address (for example `172.18.0.2:8740`) via the decoy's IP gets a TCP reset.
@@ -247,6 +255,15 @@ counts toward the 3-decoy limit from the moment its join command is created.
    only the decoy's ports answer. `--no-ssh-move` works only with the decoy on another interface.
 5. The service is `redpot-sensor`. The sensor appears in the manager within seconds.
 
+> **Give the sensor a static address or a DHCP reservation.** The manager's sensor-API allow-list names the sensor's
+> address (or network). The decoy follows a DHCP change on the manager-link interface, but the manager's allow-list
+> does not: after a new lease the manager refuses the sensor, the decoy shows as offline (L4 "stopped reporting —
+> possible tampering", with a hint for remote sensors) and its events stay in the sensor's local undelivered log
+> (Community Edition has no replay). The sensor installer warns when the manager link is a DHCP lease (default: stop).
+> If the address did change, allow the new one on the **manager**, without reinstalling:
+> `sudo ./install.sh set-access --allow-sensor 192.168.1.0/24` (see §8). Allowing the sensor's subnet instead of a
+> single address avoids the problem.
+
 If the manager is already full when the sensor enrolls, the sensor installer stops with
 "enrollment refused: decoy limit reached" and nothing is installed.
 
@@ -326,7 +343,7 @@ more than 5 minutes in the future are replaced by the manager's time (the sensor
 The file looks like this:
 
 ```json
-{"meta": {"product": "ReD-Pot", "edition": "community", "version": "1.0.0", "generated": "…",
+{"meta": {"product": "ReD-Pot", "edition": "community", "version": "1.0.1", "generated": "…",
           "range": {"from": "2026-11-01", "to": "2026-11-13", "start": "…", "end": "…"},
           "counts": {"incidents": 31, "alerts": 54}},
  "incidents": [{"id": 32, "kind": "attacker", "src_ip": "172.30.50.50", "subject": …, "first_ts": "…", "last_ts": "…",
@@ -378,11 +395,13 @@ chrome --kiosk --noerrdialogs --disable-infobars "https://10.10.0.5:59952/wall?k
 | Restart | `sudo systemctl restart redpot` (sensor: `redpot-sensor`) |
 | Decoy slots in use | *Deception* tab ("n of 3 decoys") |
 | Add / remove a local decoy | `sudo ./install.sh add-decoy` · `sudo ./install.sh remove-decoy NAME` |
+| Change the admin allow-lists (web UI, sensor API, host SSH), e.g. a remote sensor got a new address | `sudo ./install.sh set-access` (asks for all three, current lists as defaults) · unattended: `sudo ./install.sh set-access --yes --allow-sensor 192.168.1.0/24` (only the named lists change). Same checks as the install: on an address a decoy shares, a list that is open to anyone or contains the decoy's own LAN is warned about and must be confirmed (with `--yes` it is refused unless you add `--accept-exposure`). It rewrites `firewall.sh` and swaps the rules in without a gap (the old rules stay in effect until the new ones are complete; if they fail, the previous rules and the previous `firewall.sh` stay). Your current SSH client always stays allowed. Web UI / sensor API connections already open from addresses you removed are cut if the `conntrack` tool is installed; otherwise they stay open until they close (`sudo systemctl restart redpot` ends them). Host SSH sessions are never cut automatically (so your own session is safe); the output shows how to list and end them. Unchanged lists change nothing. Persona, baits and the admin token stay |
 | Export incidents and alerts | *Incidents → Export JSON*, or `sudo ./install.sh export --from YYYY-MM-DD --to YYYY-MM-DD` |
-| Show the persona and planted baits (plaintext) | `sudo docker run --rm --user 0 -v /opt/redpot/manager:/d rpot:1.0.0 ctl show -d /d` |
+| Show the persona and planted baits (plaintext) | `sudo docker run --rm --user 0 -v /opt/redpot/manager:/d rpot:1.0.1 ctl show -d /d` |
 | Event retention | `"console": {"retention_days": 90}` in `rpot.json` |
+| Console behind your own reverse proxy (bait-document beacons) | `"console": {"trust_xff": true, "trusted_proxies": ["10.0.5.20/32"]}` in `rpot.json`, then `sudo systemctl restart redpot`. `X-Forwarded-For` is used only for requests whose TCP peer is in `trusted_proxies` (empty = never, even with `trust_xff`), and only its rightmost entry (the one your proxy adds). A source taken from it is never matched against the allow-list, so it cannot mute a bait alert |
 | Mark an incident | open it → *Acknowledge*, *Close*, *False positive* |
-| New version | Community Edition supports fresh installs only: `sudo ./install.sh uninstall`, `git pull`, then install again (new persona, baits and admin token; remote sensors join again) |
+| New version | `git pull` (or check out the release tag), then `sudo ./install.sh update` on the manager and on every remote sensor — see *Upgrading* below |
 
 The persona (domain and industry) is set once at install time. Changing it means a new install.
 
@@ -403,6 +422,7 @@ sudo ./install.sh manager --yes --mgmt-if eth0 \
      --web-theme helpdesk --public-ip no --geoip yes --allow-ssh 10.8.0.0/24
 
 # one NIC: the decoy shares the management address, so all three admin allow-lists are required
+# (bait documents then report only from 10.8.0.0/24, the web UI list; the installer warns about it)
 sudo ./install.sh manager --yes --mgmt-if eth0 --domain corp.redsidesecurity.com --profile bank \
      --roles windows-file-server --names windows-file-server=RS-FS-01 \
      --allow-ui 10.8.0.0/24 --allow-sensor 10.8.0.0/24,192.168.20.0/24 --allow-ssh 10.8.0.0/24 --geoip no
@@ -434,6 +454,34 @@ Other flags: `--decoy-if` (one decoy; add-decoy and sensor), `--web-theme webmai
 `--stop-conflicting`, `--ui-port`, `--sensor-port`, `--ssh-port`, `--no-ssh-move`, `--build`, `--dir`, `--force`.
 Run `./install.sh --help` for the full list.
 
+### Upgrading
+
+`sudo ./install.sh update` updates a manager or a remote sensor in place to the version of the checked-out installer
+(`git pull`, or `git checkout v1.0.1`). Supported step: **1.0.0 → 1.0.1**, also from a 1.0.0 manager with the
+hotfix image (`rpot:1.0.0-hotfix1`), which 1.0.1 supersedes. Persona, baits, admin token, enrolled
+sensors and the database are kept. Update the manager first, then each remote sensor. `--yes` runs it unattended.
+
+1. It reads the installed version from `docker-compose.yml` and refuses anything but a supported step (on the current
+   version it says "already up to date" and changes nothing). The previous image must still be on the host.
+2. **Backup first**, in `/var/backups/redpot/<time>-<manager|sensor>-<version>/` (root only, outside the install
+   directory): the database (copied with the sqlite backup API while the console runs, then checked),
+   `rpot.json` / `conf/sensor.json`, `installer.json`, `docker-compose.yml`, `firewall.sh` and the systemd unit, with
+   each file's owner and mode. Only a Community Edition install is updated. Ctrl-C up to here changes nothing.
+3. It gets the new image the normal way (verified download, or a local build).
+4. Manager: new compose file, `firewall.sh` (with the gap-free rule swap) and unit; the rules are applied, the service
+   restarts, then the console must answer and the decoys must pass the self-test. Sensor: the image tag in its compose
+   file changes and the service restarts; its relay and decoy must be running. Signals (Ctrl-C, a dropped SSH session)
+   are ignored during this part.
+5. **On any failure** (also an unexpected error or a dropped SSH session) the previous files are restored with their
+   owners and modes and the service restarts with the previous image and firewall rules; "ROLLED BACK" is printed
+   only once the console (manager) or the relay and decoy (sensor) run again. Otherwise the output lists what is wrong
+   and where the backup is. If an update is cut off (power loss, `kill -9`), the next `sudo ./install.sh update`
+   offers to roll it back first (default no; unattended: `--yes --resume-rollback`). It refuses if the files were
+   changed after the cut-off update. Until then `add-decoy`, `remove-decoy` and `set-access` refuse to run.
+
+`sudo ./install.sh uninstall` removes the update backups of that install (`--keep-data` keeps them). Delete a
+backup directory under `/var/backups/redpot/` and the previous image (`sudo docker image rm rpot:1.0.0`) when you no longer need them.
+
 ## 10. Uninstall
 
 ```bash
@@ -455,9 +503,10 @@ Docker itself stays installed.
 | "ReD-Pot Community Edition supports up to 3 decoys in total …" | All slots are used. Remove a local decoy (`sudo ./install.sh remove-decoy NAME`), revoke a remote sensor, or cancel a pending join in *Deception*. Revoking a **local** decoy does not free its slot. After a `--force` reinstall, remote sensors of the old install still count until you revoke them. |
 | add-decoy: "the ReD-Pot console is not running" | The decoy count is read from the running manager. `sudo systemctl start redpot`, then run add-decoy again. |
 | A service on the server stopped answering after the install | It listens on an interface that now holds a decoy (the management interface included, if a decoy shares it). Only the decoy's ports and the admin ports answer there. Reach the service through another interface, or move the decoy to another interface. |
-| The web UI does not open | Your address is not in the web UI allow-list, or you use an address that is not on the management interface. Check *Admin access* in `INSTALL-INFO.txt`. |
+| The web UI does not open | Your address is not in the web UI allow-list, or you use an address that is not on the management interface. Check *Admin access* in `INSTALL-INFO.txt`; change the list with `sudo ./install.sh set-access` (from an SSH session on the manager). |
+| A remote sensor is offline after a reboot (L4 "stopped reporting") | Its address changed (DHCP) and the manager's sensor-API allow-list refuses the new one. On the manager: `sudo ./install.sh set-access --yes --allow-sensor <new address or subnet>`; better, give the sensor a static address or a DHCP reservation (§5). |
 | "already contains an installation" when adding a decoy | Use `sudo ./install.sh add-decoy`. A reinstall (`--force`) creates a new persona and baits. |
-| "this install was made by an older ReD-Pot" | Community Edition 1.0.0 supports fresh installs only: `sudo ./install.sh uninstall`, then install again. |
+| "this install was made by an older ReD-Pot" | Installs before 1.0.0 cannot be updated in place: `sudo ./install.sh uninstall`, then install again. 1.0.0 → 1.0.1: `sudo ./install.sh update`. |
 | Sensor: "presents a different certificate" | The join string belongs to another manager, or the manager was reinstalled. Create a new join command on the right manager. |
 | Sensor: "enrollment refused: decoy limit reached" | The manager has no free slot. Free one (see above) and create a new join command. |
 | `apt` errors during install | The installer repairs interrupted `dpkg` runs and ignores broken third-party repositories. If it still fails, run `sudo apt-get -f install` and start again. |
@@ -478,7 +527,7 @@ You can try everything on one Linux machine (a lab VM, not a production server) 
 simulated workstations attack them as containers. `tests/lab_scenarios.sh` does all of it:
 
 ```bash
-sudo docker build -t rpot:1.0.0 .
+sudo docker build -t rpot:1.0.1 .
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt     # rpotctl needs the Python packages
 sudo env PATH="$PWD/.venv/bin:$PATH" tests/lab_scenarios.sh all       # setup + attack; run as root (files go to uid 10001)
 # UI: https://127.0.0.1:8740  (admin token: console.admin_token in ./lab/rpot.json)
@@ -487,7 +536,7 @@ sudo env PATH="$PWD/.venv/bin:$PATH" tests/lab_scenarios.sh all       # setup + 
 `tests/lab_scenarios.sh setup` builds the lab only (`rpotctl init --net-mode bridge` with 3 decoys, `rpotctl compose`,
 `docker compose up`), `attack` runs the simulated workstations against a running lab, `all` does both, and `down` stops
 it (`./lab` is kept). `DRY_RUN=1 tests/lab_scenarios.sh all` prints every command instead of running it. Settings come
-from the environment: `P=rpotlab IMG=rpot:1.0.0 DIR=./lab PRE=172.30.50 DOMAIN=corp.redsidesecurity.com PROFILE=it
+from the environment: `P=rpotlab IMG=rpot:1.0.1 DIR=./lab PRE=172.30.50 DOMAIN=corp.redsidesecurity.com PROFILE=it
 FS_NAME=FS01 DC_NAME=DC01 WEB_NAME=WEB01`.
 
 The simulated workstations: an allowlisted scanner (recorded, no incident), a stray touch (L1), an HR user opening a
@@ -497,11 +546,11 @@ share by mistake (L3), SSH password spraying (L3), the full breadcrumb chain FS0
 Internet attackers with real public source IPs from 12 countries (for the world map), against the running lab:
 
 ```bash
-sudo tests/internet_sim.sh rpotlab rpot:1.0.0 ./lab        # DRY_RUN=1 prints the commands
+sudo tests/internet_sim.sh rpotlab rpot:1.0.1 ./lab        # DRY_RUN=1 prints the commands
 ```
 
 Without Python packages on the host, run the CLI from the image instead:
-`docker run --rm --user 0 -v $PWD/lab:/d rpot:1.0.0 ctl init -d /d --net-mode bridge …` (the same for `ctl compose`,
+`docker run --rm --user 0 -v $PWD/lab:/d rpot:1.0.1 ctl init -d /d --net-mode bridge …` (the same for `ctl compose`,
 `ctl geoip`). A lab is limited to 3 decoys like any other install; `rpotctl add-sensor` refuses a 4th.
 
 Run the test suite with `python3 -m unittest discover -s tests` (needs the packages from `requirements.txt` plus

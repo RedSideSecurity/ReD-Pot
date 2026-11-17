@@ -264,6 +264,11 @@ class TestRdpWire(unittest.TestCase):
         self.assertEqual(der_int_len(c.serial_number), 16)
         with self.assertRaises(x509.ExtensionNotFound):
             c.extensions.get_extension_for_class(x509.SubjectAlternativeName)
+        # the decoy's server thread emits after the handshake: wait for it (a single check raced under load, RC-35)
+        deadline = time.monotonic() + 5
+        while not any(e.get("detail") == "tls.direct" for e in self.em.of("proto.interaction")) \
+                and time.monotonic() < deadline:
+            time.sleep(0.05)
         self.assertTrue(any(e.get("detail") == "tls.direct" for e in self.em.of("proto.interaction")))
 
     def test_no_negotiation_data_unchanged(self):

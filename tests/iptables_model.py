@@ -121,6 +121,14 @@ class IptModel:
         if not args:
             return 2, "no command"
         op, rest = args[0], args[1:]
+        self.out = ""
+        if op == "-S":                         # list rules like iptables -S [CHAIN] (order = rule order)
+            names = rest[:1] or list(chains)
+            if any(n not in chains for n in names):
+                return 1, f"{tool}: No chain/target/match by that name."
+            self.out = "".join((f"-P {n} ACCEPT\n" if n in BUILTIN[table] else f"-N {n}\n")
+                               + "".join(f"-A {n} {' '.join(r)}\n" for r in chains[n]) for n in names)
+            return 0, ""
         if op == "-N":
             if rest[0] in chains:
                 return 1, f"{tool}: Chain already exists."

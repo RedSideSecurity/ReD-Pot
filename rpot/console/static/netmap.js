@@ -187,6 +187,8 @@ function drawOverlay(ctx) {
 async function loadGraph(refit) {
   const g = await api(`/api/graph?hours=${st.hours}&min_level=${$("#gmin").value}&scope=${$("#gscope").value}`);
   if (g.now) NM.skew = Date.parse(g.now) - Date.now();
+  const tr = document.getElementById("gtrunc");
+  if (tr) tr.hidden = !g.truncated;                 // R4-L1: the server kept only GRAPH_MAX_GROUPS pairs
   // last-seen per decoy for the "hit recently" pulse
   const lastBy = {};
   for (const e of g.edges) if (e.kind !== "member") lastBy[e.to] = lastBy[e.to] > e.last ? lastBy[e.to] : e.last;

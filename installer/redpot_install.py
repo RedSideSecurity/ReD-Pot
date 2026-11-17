@@ -19,6 +19,7 @@ Everything is asked interactively; every question also has a flag for unattended
 (--yes accepts the defaults). --dry-run prints what would be done without changing the host.
 """
 import argparse
+import contextlib
 import ipaddress
 import glob
 import json
@@ -28,8 +29,10 @@ import shlex
 import re
 import secrets
 import shutil
+import signal
 import socket
 import ssl
+import stat
 import subprocess
 import sys
 import time
@@ -100,8 +103,10 @@ READ_ONLY = ("ip", "ss", "ping", "getent", "dpkg", "apt-cache", "fuser", "system
              "docker compose version", "sshd -t", "/usr/sbin/sshd -t", "apt-get -s")
 
 
-def run(cmd, check=True, capture=False, quiet=False, env=None):
-    """env: extra variables for the child (secrets go here, never into argv — ps shows argv to every user)."""
+def run(cmd, check=True, capture=False, quiet=False, env=None, new_session=False):
+    """env: extra variables for the child (secrets go here, never into argv — ps shows argv to every user).
+    new_session: the child gets its own session (no controlling terminal), so a dropped SSH session (SIGHUP) or
+    Ctrl-C (SIGINT to the foreground process group) cannot kill it halfway (RC-35 M2: firewall apply)."""
     text = " ".join(cmd) if isinstance(cmd, list) else cmd
     # --dry-run: only read-only probes really execute; anything that changes the host is printed instead
     if A and A.dry_run and not any(text.startswith(p) for p in READ_ONLY):
@@ -109,6 +114,7 @@ def run(cmd, check=True, capture=False, quiet=False, env=None):
         return subprocess.CompletedProcess(cmd, 0, "", "")
     try:
         r = subprocess.run(cmd, shell=isinstance(cmd, str), text=True, env=dict(os.environ, **env) if env else None,
+                           start_new_session=new_session,
                            stdout=subprocess.PIPE if capture or quiet else None,
                            stderr=subprocess.PIPE if capture or quiet else None)
     except FileNotFoundError:          # program not installed → a normal failure, never a traceback
@@ -129,15 +135,17 @@ def err(msg):
     print(f"    {RED}✗ {msg}{RST}")
 
 
-def ask(q, default=None, check=None, flag=None, flagname=None):
+def ask(q, default=None, check=None, flag=None, flagname=None, secret=None):
     """One question. Wrong answers show a clear error and ask again; 'back' raises Back.
-    `flag` answers it non-interactively (unattended installs)."""
+    `flag` answers it non-interactively (unattended installs). secret=fn: the answer is a secret (the sensor join
+    string, J-1): typed without echo on a terminal, and only fn(value) — a redacted form — is ever printed."""
+    show = secret or (lambda x: x)
     if flag is not None:
         v = str(flag)
         e = check(v) if check else None
         if e:
             die(f"{flagname or q}: {e}")
-        print(f"  {q}: {BOLD}{v}{RST}")
+        print(f"  {q}: {BOLD}{show(v)}{RST}")
         return v
     if A and A.yes:
         if default is None:
@@ -146,12 +154,16 @@ def ask(q, default=None, check=None, flag=None, flagname=None):
         if e:
             die(f"unattended install (--yes): the default for '{q}' ({default}) does not work here — {e}"
                 + (f"\n  Pass {flagname} to choose explicitly (see install.sh --help)." if flagname else ""))
-        print(f"  {q}: {BOLD}{default}{RST}")
+        print(f"  {q}: {BOLD}{show(str(default))}{RST}")
         return str(default)
     while True:
-        hint = f" [{default}]" if default not in (None, "") else ""
+        hint = f" [{show(str(default))}]" if default not in (None, "") else ""
         try:
-            v = input(f"  {BOLD}?{RST} {q}{hint}: ").strip()
+            if secret and sys.stdin.isatty():
+                import getpass
+                v = getpass.getpass(f"  ? {q}{hint} (not shown): ").strip()
+            else:
+                v = input(f"  {BOLD}?{RST} {q}{hint}: ").strip()
         except EOFError:
             die("input closed — run the installer in an interactive terminal, or pass every answer as a flag (--help)")
         if v.lower() in BACK_WORDS:
@@ -1518,9 +1530,22 @@ def ask_allowlists(st, mi, shared, prev=None, keys=("ui", "sensor", "ssh")):
             if flag is None and not A.yes:
                 info(f"{DIM}A decoy shares {mi}: default = only your own address"
                      + (f" {ca}" if dflt else " (type your admin network)") + f".{RST}")
+        if key == "ui" and flag is None and not A.yes:
+            info(f"{DIM}Bait Word documents call home to this web UI port: a restricted list also limits "
+                 f"where bait documents can report from.{RST}")
         v = ask(q, dflt, _check_allow, flag=flag, flagname=f"--allow-{key}")
         allow[key] = _parse_allow(v)
+        if ",".join(allow[key]) != re.sub(r"[,\s]+", ",", v.strip()):          # L3: show what will be applied
+            info(f"{DIM}  → {', '.join(allow[key])}{RST}")
+        if key == "ui" and _restricted(allow[key]):
+            warn(BAIT_UI_WARNING)
     return allow
+
+
+# B1 (CE 1.0.1, by design in the Community Edition): document beacons are served by the console (/c/ on the web UI port).
+BAIT_UI_WARNING = ("Bait documents only report from addresses allowed to reach the console: the bait Word documents "
+                   "call home to the web UI port, so with this web UI allow-list a bait opened on any other host "
+                   "is NOT reported. (A separate beacon endpoint is planned for the Enterprise edition.)")
 
 
 ANY = "0.0.0.0/0"
@@ -1533,7 +1558,17 @@ def _parse_allow(v):
             continue
         if x.lower() in ("any", "all", "*"):
             x = ANY
-        out.append(str(ipaddress.ip_network(x, strict=False)))
+        try:
+            out.append(str(ipaddress.ip_network(x)))
+        except ValueError:
+            if "/" in x:       # security review L3: host bits set ('1.2.3.4/0') — never widen silently
+                try:
+                    net = ipaddress.ip_network(x, strict=False)
+                except ValueError:
+                    raise ValueError(f"'{x}' is not a network or address") from None
+                raise ValueError(f"'{x}' has host bits set. Type the network ({net}) or the single address "
+                                 f"({x.split('/', 1)[0]}) instead") from None
+            raise ValueError(f"'{x}' is not a network or address") from None
     return [ANY] if ANY in out or not out else sorted(set(out))
 
 
@@ -1562,6 +1597,20 @@ def allow_exposure(sharers, iface, allow):
         if hit:
             out.append((svc, hit, str(lan)))
     return out
+
+
+def exposure_text(svc, nets, lan, who, n_who=1):
+    """B9 warning text (install review, set-access, add-decoy), worded by how the allowed network(s) relate to the
+    decoy LAN (QA Q4: never 'allowed from X, which includes X')."""
+    lives = "lives" if n_who == 1 else "live"
+    L = ipaddress.ip_network(lan)
+    rel = {ipaddress.ip_network(n) == L and "is" or ipaddress.ip_network(n).supernet_of(L) and "includes"
+           or ipaddress.ip_network(n).subnet_of(L) and "inside" or "overlaps" for n in nets}
+    if len(nets) == 1 and rel == {"is"}:
+        return f"{svc} is allowed from {lan}, the network {who} {lives} in."
+    how = {"includes": "which includes", "inside": "which is part of", "is": "which is"}.get(rel.pop() if len(rel) == 1
+                                                                                             else "", "which overlaps")
+    return f"{svc} is allowed from {', '.join(nets)}, {how} {lan} — the network {who} {lives} in."
 
 
 def _restricted(nets):
@@ -1630,22 +1679,44 @@ def _fw_check(dif, out_guard):
     dead code, and the policy would fail OPEN without a word. Docker with the nftables backend has no DOCKER-USER
     hook (apply then hooks REDPOT-DOCKER into FORWARD itself); without ip6tables the IPv6 chains are missing, which is
     only fine where IPv6 is off. Prints what is missing and returns 1, so the unit does not start."""
+    # either generation of a chain counts (RC-35 M2: REDPOT-* or REDPOT-*-B, see apply)
     L = ["check() {   # are the chains in effect? (review F6: fail closed, never silently open)", '  bad=""',
-         '  $IPT -C INPUT -j REDPOT-IN 2>/dev/null || bad="$bad INPUT->REDPOT-IN"',
-         "  { $IPT -C DOCKER-USER -j REDPOT-DOCKER 2>/dev/null && $IPT -C FORWARD -j DOCKER-USER 2>/dev/null; } || "
-         '$IPT -C FORWARD -j REDPOT-DOCKER 2>/dev/null || bad="$bad FORWARD->REDPOT-DOCKER"']
+         '  { $IPT -C INPUT -j REDPOT-IN 2>/dev/null || $IPT -C INPUT -j REDPOT-IN-B 2>/dev/null; } || '
+         'bad="$bad INPUT->REDPOT-IN"',
+         "  { { $IPT -C DOCKER-USER -j REDPOT-DOCKER 2>/dev/null || $IPT -C DOCKER-USER -j REDPOT-DOCKER-B 2>/dev/null; } "
+         "&& $IPT -C FORWARD -j DOCKER-USER 2>/dev/null; } || "
+         "$IPT -C FORWARD -j REDPOT-DOCKER 2>/dev/null || $IPT -C FORWARD -j REDPOT-DOCKER-B 2>/dev/null || "
+         'bad="$bad FORWARD->REDPOT-DOCKER"']
     if dif:
-        L.append(f"  if v6on {' '.join(dif)}; then $IP6T -C INPUT -j REDPOT-IN6 2>/dev/null || "
+        L.append(f"  if v6on {' '.join(dif)}; then {{ $IP6T -C INPUT -j REDPOT-IN6 2>/dev/null || "
+                 "$IP6T -C INPUT -j REDPOT-IN6-B 2>/dev/null; } || "
                  'bad="$bad ip6tables:INPUT->REDPOT-IN6"; fi')
     if out_guard:
-        L += ['  $IPT -C OUTPUT -j REDPOT-OUT 2>/dev/null || bad="$bad OUTPUT->REDPOT-OUT"',
-              '  if v6on; then $IP6T -C OUTPUT -j REDPOT-OUT6 2>/dev/null || bad="$bad ip6tables:OUTPUT->REDPOT-OUT6"; fi']
+        L += ['  { $IPT -C OUTPUT -j REDPOT-OUT 2>/dev/null || $IPT -C OUTPUT -j REDPOT-OUT-B 2>/dev/null; } || '
+              'bad="$bad OUTPUT->REDPOT-OUT"',
+              '  if v6on; then { $IP6T -C OUTPUT -j REDPOT-OUT6 2>/dev/null || $IP6T -C OUTPUT -j REDPOT-OUT6-B '
+              '2>/dev/null; } || bad="$bad ip6tables:OUTPUT->REDPOT-OUT6"; fi']
     L += ['  [ -z "$bad" ] && return 0',
           '  echo "ReD-Pot firewall NOT in effect:$bad - refusing to start the decoys (fail closed). Needs iptables and'
           ' ip6tables (or IPv6 disabled on the decoy interfaces) and Docker with its iptables firewall backend or a hookable'
           ' FORWARD chain." >&2',
           "  return 1", "}"]
     return L
+
+
+def _fw_gen_ok(dif, out_guard):
+    """gen_ok() of firewall.sh (RC-35 R2-M1): is generation $1 ('' or -B) hooked at EVERY hook point this config
+    needs (the same points as check())? Used by curgen to tell the complete generation from a half-built one."""
+    L = ["gen_ok() {   # $1 = '' or -B: hooked everywhere = complete (see curgen)",
+         "  $IPT -C INPUT -j REDPOT-IN$1 2>/dev/null || return 1",
+         "  { $IPT -C DOCKER-USER -j REDPOT-DOCKER$1 2>/dev/null && $IPT -C FORWARD -j DOCKER-USER 2>/dev/null; } || "
+         "$IPT -C FORWARD -j REDPOT-DOCKER$1 2>/dev/null || return 1"]
+    if dif:
+        L.append(f"  if v6on {' '.join(dif)}; then $IP6T -C INPUT -j REDPOT-IN6$1 2>/dev/null || return 1; fi")
+    if out_guard:
+        L += ["  $IPT -C OUTPUT -j REDPOT-OUT$1 2>/dev/null || return 1",
+              "  if v6on; then $IP6T -C OUTPUT -j REDPOT-OUT6$1 2>/dev/null || return 1; fi"]
+    return L + ["  return 0", "}"]
 
 
 def firewall_text(mi, allow, ports, move_ssh, ttl=(), mgmt_if=None, decoys=(), out_guard=False, follow=False):
@@ -1692,20 +1763,53 @@ def firewall_text(mi, allow, ports, move_ssh, ttl=(), mgmt_if=None, decoys=(), o
     dif = list(dict.fromkeys(x["iface"] for x in decoys))          # decoy interfaces, management possibly included
     via = f"-i {mgmt_if} " if decoys and mgmt_if else ""
     dmi = "" if follow else f"-d {mi} "                             # follow: today's lease may change
-    L = ["#!/bin/sh", "# generated by the ReD-Pot installer — do not edit (re-run add-decoy / remove-decoy instead)",
+    L = ["#!/bin/sh", "# generated by the ReD-Pot installer — do not edit (re-run add-decoy / remove-decoy / set-access instead)",
          "# admin-port allowlists (everyone else: TCP reset, like a closed port), decoy-interface policy,",
          "# decoy egress guard, TTL 128 for Windows decoys",
          "IPT=$(command -v iptables || echo /usr/sbin/iptables)",
          "IP6T=$(command -v ip6tables || echo /usr/sbin/ip6tables)",
          'ARP_BAK="$(cd "$(dirname "$0")" && pwd)/arp-sysctl.bak"',
+         "REAL_IPT=$IPT; REAL_IP6T=$IP6T; NEW=''; FAIL=''; V6=0",
+         "# Make-before-break (RC-35 M2): the rules exist in two generations, REDPOT-* and REDPOT-*-B. apply builds the",
+         "# generation that is NOT in effect, hooks each of its chains only once it is complete (in front of the old",
+         "# ones), and unhooks + deletes the old generation only after every new chain is hooked. At every moment one",
+         "# complete generation is in effect; a failed build is dropped again and the old rules stay.",
+         "_g() {   # $1 = real tool: REDPOT-* chain arguments get the suffix $NEW; failed -A/-I are recorded in FAIL",
+         '  t=$1; shift; n=$#',
+         '  for a in "$@"; do',
+         '    case "$a" in REDPOT-IN|REDPOT-DOCKER|REDPOT-OUT|REDPOT-IN6|REDPOT-OUT6|REDPOT-TTL) a="$a$NEW" ;; esac',
+         '    set -- "$@" "$a"',
+         "  done",
+         '  shift $n',
+         '  if [ -n "$FAIL" ] && [ "$1" = -I ]; then FAIL="$FAIL | not hooked: $*"; return 1; fi   # never hook a broken build',
+         '  "$t" "$@"; r=$?',
+         '  # ip6tables failures count only where IPv6 is on (V6, the same condition as the installer preflight)',
+         '  if [ $r != 0 ]; then case "$1" in -A|-I) if [ "$t" != "$REAL_IP6T" ] || [ "$V6" = 1 ]; then',
+         '    FAIL="$FAIL | $*"; fi ;; esac; fi',
+         "  return $r", "}",
+         'gipt() { _g "$REAL_IPT" "$@"; }',
+         'gip6t() { _g "$REAL_IP6T" "$@"; }',
+         'unhook() { i=0; while [ $i -lt 20 ] && "$@" 2>/dev/null; do i=$((i+1)); done; return 0; }',
+         "dropgen() {   # $1 = generation suffix ('' or -B): unhook (INPUT first, see apply) and delete its chains",
+         "  unhook $IPT -D INPUT -j REDPOT-IN$1; unhook $IPT -D DOCKER-USER -j REDPOT-DOCKER$1",
+         "  unhook $IPT -D FORWARD -j REDPOT-DOCKER$1; unhook $IPT -D OUTPUT -j REDPOT-OUT$1",
+         "  for c in REDPOT-IN$1 REDPOT-DOCKER$1 REDPOT-OUT$1; do $IPT -F $c 2>/dev/null; $IPT -X $c 2>/dev/null; done",
+         "  unhook $IP6T -D INPUT -j REDPOT-IN6$1; unhook $IP6T -D OUTPUT -j REDPOT-OUT6$1",
+         "  for c in REDPOT-IN6$1 REDPOT-OUT6$1; do $IP6T -F $c 2>/dev/null; $IP6T -X $c 2>/dev/null; done",
+         "  unhook $IPT -t mangle -D OUTPUT -j REDPOT-TTL$1; $IPT -t mangle -F REDPOT-TTL$1 2>/dev/null",
+         "  $IPT -t mangle -X REDPOT-TTL$1 2>/dev/null",
+         "  return 0", "}",
+         "curgen() {   # the generation in effect: '' or -B ('none' if no REDPOT-IN* is hooked) — RC-35 R2-M1:",
+         "  # new hooks are always inserted at position 1, so the OLDER generation is further down INPUT. From the oldest,",
+         "  # take the first one hooked at EVERY hook point (gen_ok): a chain is hooked only once complete, so that one is",
+         "  # complete. After an interrupted run both may be hooked; the half-built one is never chosen.",
+         "  rev=''",
+         "  for g in $($IPT -S INPUT 2>/dev/null | sed -n 's/^-A INPUT -j REDPOT-IN\\(-B\\)\\{0,1\\}$/=\\1/p'); do rev=\"$g $rev\"; done",
+         '  [ -n "$rev" ] || { echo none; return; }',
+         '  for g in $rev; do if gen_ok "${g#=}"; then echo "${g#=}"; return; fi; done',
+         '  set -- $rev; echo "${1#=}"   # none complete (already broken): the oldest; apply rebuilds the other one', "}",
          "remove() {",
-         "  $IPT -D INPUT -j REDPOT-IN 2>/dev/null; $IPT -D DOCKER-USER -j REDPOT-DOCKER 2>/dev/null",
-         "  $IPT -D FORWARD -j REDPOT-DOCKER 2>/dev/null; $IPT -D OUTPUT -j REDPOT-OUT 2>/dev/null",
-         "  for c in REDPOT-IN REDPOT-DOCKER REDPOT-OUT; do $IPT -F $c 2>/dev/null; $IPT -X $c 2>/dev/null; done",
-         "  $IP6T -D INPUT -j REDPOT-IN6 2>/dev/null; $IP6T -D OUTPUT -j REDPOT-OUT6 2>/dev/null",
-         "  for c in REDPOT-IN6 REDPOT-OUT6; do $IP6T -F $c 2>/dev/null; $IP6T -X $c 2>/dev/null; done",
-         "  $IPT -t mangle -D OUTPUT -j REDPOT-TTL 2>/dev/null; $IPT -t mangle -F REDPOT-TTL 2>/dev/null",
-         "  $IPT -t mangle -X REDPOT-TTL 2>/dev/null",
+         "  dropgen ''; dropgen -B",
          '  if [ -f "$ARP_BAK" ]; then',
          '    while read -r f v; do',
          '      case "$f" in /proc/sys/net/ipv4/conf/*/arp_ignore|/proc/sys/net/ipv4/conf/*/arp_announce) ;; *) continue ;; esac',
@@ -1718,13 +1822,33 @@ def firewall_text(mi, allow, ports, move_ssh, ttl=(), mgmt_if=None, decoys=(), o
          "arp() {   # $1 = decoy interface: answer ARP only for its own address, announce only it",
          "  for k in arp_ignore:1 arp_announce:2; do",
          '    f=/proc/sys/net/ipv4/conf/$1/${k%%:*}; [ -w "$f" ] || continue',
-         '    echo "$f $(cat "$f")" >> "$ARP_BAK"; echo "${k##*:}" > "$f"',
+         '    grep -q "^$f " "$ARP_BAK" 2>/dev/null || echo "$f $(cat "$f")" >> "$ARP_BAK"   # the original value, once',
+         '    echo "${k##*:}" > "$f"',
          "  done", "}",
+         "arp_keep() {   # $* = decoy interfaces now: restore + forget the ARP settings of every other interface",
+         '  [ -f "$ARP_BAK" ] || return 0',
+         '  : > "$ARP_BAK.new"',
+         '  while read -r f v; do',
+         '    case "$f" in /proc/sys/net/ipv4/conf/*/arp_ignore|/proc/sys/net/ipv4/conf/*/arp_announce) ;; *) continue ;; esac',
+         '    n=${f#/proc/sys/net/ipv4/conf/}; n=${n%%/*}',
+         '    case " $* " in *" $n "*) echo "$f $v" >> "$ARP_BAK.new" ;;',
+         '      *) case "$v" in ""|*[!0-9]*) ;; *) [ -w "$f" ] && echo "$v" > "$f" ;; esac ;; esac',
+         '  done < "$ARP_BAK"',
+         '  mv -f "$ARP_BAK.new" "$ARP_BAK"', "}",
          "v6on() {   # IPv6 enabled on any of these interfaces (no argument: on any interface but lo)?",
          '  [ $# -gt 0 ] || set -- $(ls /proc/sys/net/ipv6/conf 2>/dev/null | grep -vx "all\\|default\\|lo")',
          '  for n in "$@"; do [ "$(cat /proc/sys/net/ipv6/conf/$n/disable_ipv6 2>/dev/null)" = 0 ] && return 0; done',
-         "  return 1", "}"] + _fw_check(dif, out_guard) + [
-         "apply() {", "  remove", "  $IPT -N REDPOT-IN; $IPT -N REDPOT-DOCKER",
+         "  return 1", "}"] + _fw_check(dif, out_guard) + _fw_gen_ok(dif, out_guard) + [
+         "apply() {",
+         "  trap '' HUP INT TERM   # RC-35 M2: a dropped SSH session, Ctrl-C or a stray TERM must not stop a swap halfway",
+         "  CUR=$(curgen)",
+         '  case "$CUR" in "") NEW=-B ;; *) NEW="" ;; esac',
+         '  dropgen "$NEW"   # leftovers of an interrupted run: never the generation in effect',
+         '  [ "$CUR" = none ] && dropgen -B',
+         ("  if v6on; then V6=1; fi   # ip6tables failures count where IPv6 is on (V6)" if dif else
+          "  # no decoy interface: ip6tables failures do not count (V6=0, the installer preflight does not need it)"),
+         "  FAIL=''; IPT=gipt; IP6T=gip6t   # from here on: build generation $NEW (chain names as written below)",
+         "  $IPT -N REDPOT-IN; $IPT -N REDPOT-DOCKER",
          "  $IPT -A REDPOT-IN -i lo -j RETURN",
          "  $IPT -A REDPOT-IN -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN",
          "  $IPT -A REDPOT-DOCKER -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN"]
@@ -1842,16 +1966,33 @@ def firewall_text(mi, allow, ports, move_ssh, ttl=(), mgmt_if=None, decoys=(), o
               "  else echo 'ReD-Pot: ip6tables unavailable - IPv6 egress of the decoys cannot be filtered' >&2; fi"]
     if ttl:
         # xt_TTL may be missing (minimal kernels): warn, never fail the service start
-        L += ["  if $IPT -t mangle -N REDPOT-TTL 2>/dev/null && $IPT -t mangle -I OUTPUT 1 -j REDPOT-TTL; then"]
+        L += ["  if $IPT -t mangle -N REDPOT-TTL 2>/dev/null; then"]
         by_ip = {x["ip"]: x["iface"] for x in decoys}
         for ip, sports in ttl:
             match = f" -p tcp -m multiport --sports {','.join(map(str, sports))}" if sports else ""
             src = f"-o {by_ip[ip]}" if follow and ip in by_ip else f"-s {ip}"
             L.append(f"    $IPT -t mangle -A REDPOT-TTL {src}{match} -j TTL --ttl-set 128 2>/dev/null || "
                      f"echo 'ReD-Pot: iptables TTL target (xt_TTL) unavailable - {ip} keeps TTL 64' >&2")
-        L += ["  fi"]
-    L += ["  check   # every chain hooked, or a non-zero exit: the unit does not start (fail closed, review F6)", "}",
-          'case "$1" in apply) apply ;; remove) remove ;; check) check ;; *) echo "usage: $0 apply|remove|check"; exit 2 ;; esac']
+        L += ["    $IPT -t mangle -I OUTPUT 1 -j REDPOT-TTL 2>/dev/null", "  fi"]
+    L += ["  IPT=$REAL_IPT; IP6T=$REAL_IP6T",
+          '  if [ -n "$FAIL" ]; then',
+          '    dropgen "$NEW"',
+          '    if check 2>/dev/null; then',
+          '      echo "ReD-Pot: building the new firewall rules failed:$FAIL - the new rules were taken out again;'
+          ' the rules in effect before stay in effect" >&2',
+          "    else",
+          '      echo "ReD-Pot: building the new firewall rules failed:$FAIL - and the rules in effect before are NOT'
+          ' complete either: this host is NOT protected by the ReD-Pot firewall now. Stop ReD-Pot: systemctl stop redpot'
+          ' (sensor: redpot-sensor), fix the cause, then start it again (the start applies the rules or refuses to run)." >&2',
+          "    fi",
+          "    return 1",
+          "  fi",
+          '  [ "$CUR" = none ] || dropgen "$CUR"   # every new chain is hooked: now the old generation goes',
+          f"  arp_keep {' '.join(dif)}",
+          "  check   # every chain hooked, or a non-zero exit: the unit does not start (fail closed, review F6)", "}",
+          # drop -B: take out generation -B only (update rollback: the 1.0.0 rules it restarts with use REDPOT-*)
+          'case "$1" in apply) apply ;; remove) remove ;; check) check ;; drop) [ "$2" = -B ] && dropgen -B ;;'
+          ' *) echo "usage: $0 apply|remove|check|drop -B"; exit 2 ;; esac']
     return "\n".join(L) + "\n", restricted
 
 
@@ -1912,6 +2053,24 @@ def write_firewall(d, st, decoys=None):
 FW_FIX = "Fix that (install iptables/ip6tables, or use Docker's iptables firewall backend)"
 
 
+@contextlib.contextmanager
+def uninterruptible():
+    """RC-35 M2: while firewall rules are being swapped (and during the fallback) SIGINT / SIGHUP / SIGTERM are
+    ignored, so Ctrl-C or a dropped SSH session cannot stop the installer between "new rules failed" and "previous
+    rules back / stack stopped". Handlers are restored afterwards."""
+    old = {}
+    try:
+        for s in (signal.SIGINT, signal.SIGHUP, signal.SIGTERM):
+            old[s] = signal.signal(s, signal.SIG_IGN)
+    except ValueError:                  # not the main thread (tests): nothing to change
+        pass
+    try:
+        yield
+    finally:
+        for s, h in old.items():
+            signal.signal(s, h)
+
+
 def apply_firewall(d, unit="redpot", prev=None, change=False):
     """Put firewall.sh in effect now (before the unit starts the decoys). Its check (review F6) fails when a chain is
     not hooked (Docker nftables backend without a usable FORWARD chain, no ip6tables while IPv6 is on): the rules
@@ -1921,15 +2080,19 @@ def apply_firewall(d, unit="redpot", prev=None, change=False):
     closed before die(): re-apply the previous firewall.sh text `prev` (the running containers keep the rules they
     had), and if there is none or it fails too, stop the whole stack (_stop_stack)."""
     p = os.path.join(d, FIREWALL)
-    r = run(["/bin/sh", p, "apply"], check=False, capture=True)
-    if r.returncode == 0:
-        return True
-    run(["/bin/sh", p, "remove"], check=False, quiet=True)
-    why = _clean_text(r.stderr or "").strip()[-900:]
-    if not change:
-        die("the ReD-Pot firewall could not be put in effect, so the decoys were NOT started:\n  " + why
-            + f"\n{FW_FIX}, then run the installer again (sudo ./install.sh).")
-    die("the new ReD-Pot firewall could not be put in effect:\n  " + why + "\n" + _fall_back(d, unit, prev)
+    with uninterruptible():
+        r = run(["/bin/sh", p, "apply"], check=False, capture=True, new_session=True)
+        if r.returncode == 0:
+            return True
+        why = _clean_text(r.stderr or "").strip()[-900:]
+        if not change:
+            run(["/bin/sh", p, "remove"], check=False, quiet=True, new_session=True)
+            die("the ReD-Pot firewall could not be put in effect, so the decoys were NOT started:\n  " + why
+                + f"\n{FW_FIX}, then run the installer again (sudo ./install.sh).")
+        # the stack runs: never strip the rules first (M2, make-before-break). A failed build left the previous
+        # generation in effect; a failed check is repaired by re-applying prev, or the stack is stopped.
+        fb = _fall_back(d, unit, prev)
+    die("the new ReD-Pot firewall could not be put in effect:\n  " + why + "\n" + fb
         + f"\n{FW_FIX}, then run  sudo systemctl restart {unit}  — until then every start of {unit} refuses to start "
           f"the containers (fail closed).")
 
@@ -1945,17 +2108,18 @@ def _fall_back(d, unit, prev):
         with os.fdopen(fd, "w") as f:
             f.write(prev)
         try:
-            r = run(["/bin/sh", pp, "apply"], check=False, capture=True)
+            r = run(["/bin/sh", pp, "apply"], check=False, capture=True, new_session=True)
             if r.returncode == 0:
                 return ("The PREVIOUS firewall rules were put back in effect: the console and the existing decoys keep "
                         "running behind them. The change was NOT started.")
-            run(["/bin/sh", pp, "remove"], check=False, quiet=True)
         finally:
             os.remove(pp)
+    # stop first, then take the rules out (M2): never console/decoys running with the rules already removed
     if _stop_stack(d, unit):
+        run(["/bin/sh", os.path.join(d, FIREWALL), "remove"], check=False, quiet=True, new_session=True)
         return (("The previous rules could not be restored either" if prev else "There were no previous rules")
                 + f", so ReD-Pot (console and every decoy) was STOPPED: nothing of it runs without its firewall.")
-    return (f"{RED}{BOLD}WARNING: ReD-Pot could NOT be stopped and runs WITHOUT its firewall — stop it now: "
+    return (f"{RED}{BOLD}WARNING: ReD-Pot could NOT be stopped and its firewall is incomplete — stop it now: "
             f"sudo docker compose -p {unit} stop{RST}")
 
 
@@ -2140,12 +2304,15 @@ def dhcp_bound(st):
     out = []
     if st.get("join"):
         # sensor: on the manager-link interface the decoy follows a DHCP change (S-1 L14) and the moved SSH listens
-        # on every address — nothing is bound to a lease. On another interface both addresses are bound.
-        if not st["single"]:
-            for key, what in (("mgmt", "manager link, host SSH"), ("_decoy", "decoy")):
-                i = st["ifs"][st["mgmt"] if key == "mgmt" else st["role_if"]["_"]]
-                if i.get("dynamic"):
-                    out.append((i["ip"], i["name"], what))
+        # on every address. On another interface both addresses are bound. B5 (1.0.1): either way the manager's
+        # sensor-API allow-list names the manager-link address, so a new lease is refused by the manager.
+        mi = st["ifs"][st["mgmt"]]
+        if mi.get("dynamic"):
+            out.append((mi["ip"], mi["name"], ("manager link" if st["single"] else "manager link, host SSH")
+                        + SENSOR_DHCP_WHAT))
+        i = st["ifs"][st["role_if"]["_"]] if not st["single"] else {}
+        if i.get("dynamic") and i is not mi:
+            out.append((i["ip"], i["name"], "decoy"))
         return out
     mi = st["ifs"][st["mgmt"]]
     if mi.get("dynamic"):
@@ -2159,6 +2326,9 @@ def dhcp_bound(st):
     return out
 
 
+SENSOR_DHCP_WHAT = " (the manager's sensor-API allow-list may name only this address)"
+
+
 def confirm_dhcp(st):
     """Warn about DHCP-bound addresses; interactive installs must confirm (default no)."""
     dyn = dhcp_bound(st)
@@ -2166,9 +2336,15 @@ def confirm_dhcp(st):
         return True
     for ip, ifname, what in dyn:
         warn(f"{ip} ({ifname}) is a DHCP lease, not a static address — used for: {what}.")
-    warn("If DHCP gives this server another address after a reboot, these stop answering"
-         + (" and host SSH may be unreachable" if any("SSH" in w for _, _, w in dyn) else "")
-         + ". Make the address static (netplan) or reserve it in your DHCP server.")
+    if st.get("join"):
+        # B5: the decoy follows the lease on the manager link, but the manager's firewall does not
+        warn("A remote sensor needs a static address or a DHCP reservation. If DHCP gives it another address, the "
+             "manager's sensor-API allow-list refuses it: the decoy goes offline (L4 tamper alert) and its events "
+             "are lost until the new address is allowed on the manager (sudo ./install.sh set-access --allow-sensor …).")
+    if not (st.get("join") and st["single"]):
+        warn("If DHCP gives this server another address after a reboot, these stop answering"
+             + (" and host SSH may be unreachable" if any("SSH" in w for _, _, w in dyn) else "")
+             + ". Make the address static (netplan) or reserve it in your DHCP server.")
     if A.yes:
         return True
     return ask_yes("Continue with DHCP addresses anyway?", False)
@@ -2211,9 +2387,8 @@ def review(st, sections):
              f"{'it' if len(open_) == 1 else 'them'}. Type 5 to limit who may reach {'it' if len(open_) == 1 else 'them'}.")
     for svc, nets, lan in allow_exposure(shared, mi, al):
         sharers = " and ".join(st["names"][r] for r in shared)
-        warn(f"{svc} is allowed from {', '.join(nets)}, which includes {lan} — the network {sharers} "
-             f"{'lives' if len(shared) == 1 else 'live'} in. Anyone there who scans {mi['ip']} sees {svc} next "
-             f"to the decoy. Type 5 and allow only your admin hosts/VPN (e.g. 10.8.0.0/24, 192.168.1.10).")
+        warn(exposure_text(svc, nets, lan, sharers, len(shared)) + f" Anyone there who scans {mi['ip']} sees {svc} "
+             f"next to the decoy. Type 5 and allow only your admin hosts/VPN (e.g. 10.8.0.0/24, 192.168.1.10).")
     if st.get("stop_units"):
         print(f"    {RED}will stop + disable: {', '.join(st['stop_units'])}{RST} {DIM}(re-enabled by uninstall){RST}")
     sess = ssh_session_ip()
@@ -2618,9 +2793,29 @@ def uninstall_plan(targets, keep, purge):
         L.append(f"host SSH listens on every address again: {PIN_CONF}")
     if os.path.exists(MOTD):
         L.append(f"login banner {MOTD}")
+    kinds = {("manager" if u == "redpot" else "sensor") for u, _, _ in targets if u}
+    for k in sorted(kinds):
+        if os.path.exists(_marker(k)):
+            L.append(f"unfinished-update marker {_marker(k)}")
+        bks = _backups_of(k)
+        if bks:
+            L.append(f"{len(bks)} update backup(s) of the {k} in {UPDATE_BACKUP_ROOT}"
+                     + (" — KEPT (--keep-data)" if keep else " (they hold a copy of the database and rpot.json)"))
     if purge:
         L.append(f"Docker image {IMAGE}")
     return L
+
+
+def _backups_of(kind):
+    """Update backups of a manager / sensor in UPDATE_BACKUP_ROOT (<time>-<kind>-<version>/, real dirs only)."""
+    try:
+        names = os.listdir(UPDATE_BACKUP_ROOT)
+    except OSError:
+        return []
+    return sorted(os.path.join(UPDATE_BACKUP_ROOT, n) for n in names
+                  if re.fullmatch(rf"\d{{8}}T\d{{6}}-{kind}-\d+\.\d+\.\d+", n)
+                  and os.path.isdir(os.path.join(UPDATE_BACKUP_ROOT, n))
+                  and not os.path.islink(os.path.join(UPDATE_BACKUP_ROOT, n)))
 
 
 def uninstall():
@@ -2669,6 +2864,17 @@ def uninstall():
         if not keep:
             shutil.rmtree(d, ignore_errors=True)
         info(f"removed {unit}" + (f" (data kept in {d})" if keep else ""))
+    for unit, d, project in targets:            # R4-L2: no stale update state survives an uninstall
+        if unit is None:
+            continue
+        k = "manager" if unit == "redpot" else "sensor"
+        if os.path.isfile(_marker(k)):
+            os.remove(_marker(k))
+        bks = [] if keep else _backups_of(k)
+        for bdir in bks:
+            shutil.rmtree(bdir, ignore_errors=True)
+        if bks:
+            info(f"removed {len(bks)} update backup(s) of the {k} from {UPDATE_BACKUP_ROOT}")
     run(["systemctl", "daemon-reload"], check=False, quiet=True)
     restore_ssh()                    # decoys are gone → port 22 is free again
     unpin_ssh()
@@ -2692,12 +2898,9 @@ def write_info(d, kind, rows, ok, ssh_port, *ports, decoys_ok=True):
     print(f"\n  Saved to {d}/INSTALL-INFO.txt (root only). Port reminder added to the SSH login banner.\n")
     if A.dry_run:
         return
-    p = os.path.join(d, "INSTALL-INFO.txt")
-    with open(p, "w") as f:
-        f.write(f"ReD-Pot {kind} — installed {time.strftime('%Y-%m-%d %H:%M')}\n\n")
-        for k, v in rows:
-            f.write(f"{k:<{w}}  {v}\n")
-    os.chmod(p, 0o600)
+    write_private(os.path.join(d, "INSTALL-INFO.txt"),
+                  f"ReD-Pot {kind} — installed {time.strftime('%Y-%m-%d %H:%M')}\n\n"
+                  + "".join(f"{k:<{w}}  {v}\n" for k, v in rows))
     write_motd(kind, rows)
 
 
@@ -2743,7 +2946,8 @@ def step_join(st):
         if got != fp:
             return (f"The manager at {host}:{port} presents a DIFFERENT certificate than the join string expects "
                     f"(expected {fp[:16]}…, got {got[:16]}…). Refusing — create a new join command on the right manager.")
-    st["join"], role = join_role_hint(ask("Join string", st.get("join"), check, flag=A.join, flagname="--join"))
+    st["join"], role = join_role_hint(ask("Join string", st.get("join"), check, flag=A.join, flagname="--join",
+                                          secret=redact_join))
     hostport = st["join"][len("redpot://"):].split("/", 1)[0]
     st["manager"] = hostport
     st["role"] = None
@@ -3126,16 +3330,33 @@ STATE_FILE = "installer.json"
 PORT_CONF = "/etc/ssh/sshd_config.d/00-redpot-port.conf"
 
 
+def write_private(p, text, mode=0o600, owner=None):
+    """Atomic, root-only file write (security review I2): O_NOFOLLOW temp file in the same directory, fsync, then
+    os.replace — a crash never leaves half a file, and a planted symlink is never followed. owner=(uid, gid): set on
+    the temp file's fd BEFORE the rename (R4-I1), so the file never appears with the wrong owner."""
+    tmp = p + ".new"
+    try:
+        os.unlink(tmp)                         # a leftover (or a planted symlink) of an interrupted run
+    except FileNotFoundError:
+        pass
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode)
+    with os.fdopen(fd, "w") as f:
+        f.write(text)
+        f.flush()
+        os.fchmod(f.fileno(), mode)
+        if owner is not None:
+            os.fchown(f.fileno(), owner[0], owner[1])
+        os.fsync(f.fileno())
+    os.replace(tmp, p)
+
+
 def save_state(d, st):
     """What add-decoy / remove-decoy need later: management interface, admin ports, allowlists, SSH changes."""
     if A.dry_run:
         return
     keep = {k: st[k] for k in ("mgmt", "allow", "ports", "move_ssh", "pin_ssh", "public_ip") if k in st}
     keep["mgmt_ip"] = st["ifs"][st["mgmt"]]["ip"]
-    p = os.path.join(d, STATE_FILE)
-    with open(p, "w") as f:
-        json.dump(keep, f, indent=1)
-    os.chmod(p, 0o600)
+    write_private(os.path.join(d, STATE_FILE), json.dumps(keep, indent=1))
 
 
 def load_state(d):
@@ -3147,9 +3368,21 @@ def load_state(d):
     return json.load(open(p))
 
 
-def _existing_manager(d):
+def redact_join(v):
+    """J-1: a join string as it may be shown: manager address only (the token and fingerprint never on screen)."""
+    m = re.match(r"redpot://([^/\s]+)/", v or "")
+    return f"redpot://{m.group(1)}/… (hidden)" if m else "(hidden)"
+
+
+def _existing_manager(d, purpose="add-decoy"):
     if not os.path.exists(os.path.join(d, "rpot.json")):
         if os.path.exists(os.path.join(d, "conf", "sensor.json")) or os.path.exists("/opt/redpot/sensor/conf/sensor.json"):
+            if purpose == "set-access":            # S-1
+                die("this server is a remote SENSOR. set-access changes the MANAGER's web UI / sensor API / host SSH "
+                    "allow-lists: run it on the manager. A sensor has only a host-SSH allow-list, chosen when it was "
+                    "installed (it is in firewall.sh); this version cannot change it in place, because a sensor does "
+                    "not store its install choices. To change it: sudo ./install.sh uninstall here, create a new join "
+                    "command on the manager (Deception → Add a sensor) and install the sensor again with the new list.")
             die("this server is a remote SENSOR (one decoy). To add a decoy, install another sensor from the manager "
                 "(Deception → Add a sensor), or run add-decoy on the manager.")
         die(f"no ReD-Pot manager found in {d} — install it first (sudo ./install.sh manager), or pass --dir")
@@ -3206,8 +3439,10 @@ def decoy_slots(d, cfg=None):
         die(f"could not read the decoy count from the console (rpotctl slots): {e}")
 
 
-def _add_context(d, slots=True):
-    cfg = _existing_manager(d)
+def _add_context(d, slots=True, guard=True, purpose="add-decoy"):
+    if guard:                                  # add-decoy / remove-decoy / set-access: not on a half-updated install;
+        marker_guard("manager")                # update itself owns the marker (guard=False, U-1)
+    cfg = _existing_manager(d, purpose)
     role_catalog()
     stt = load_state(d)
     ifs = interfaces()
@@ -3219,7 +3454,7 @@ def _add_context(d, slots=True):
     if not mgmt:
         die(f"the management address {stt.get('mgmt_ip')} of this install is not on any interface any more "
             f"(DHCP gave the server another address?). Fix the address first.")
-    st.update(mgmt=mgmt, allow=stt.get("allow") or {}, ports=stt["ports"], move_ssh=stt.get("move_ssh", False),
+    st.update(mgmt=mgmt, allow=_checked_state_allow(stt), ports=_checked_state_ports(stt), move_ssh=stt.get("move_ssh", False),
               pin_ssh=stt.get("pin_ssh", False), public_ip=stt.get("public_ip"), single=len(ifs) == 1)
     st["admin_ports"] = {st["ports"]["ui"], st["ports"]["sensor"]} | ({st["ports"]["ssh"]} if st["move_ssh"] else set())
     if slots:
@@ -3227,6 +3462,35 @@ def _add_context(d, slots=True):
         if sl["used"] >= MAX_DECOYS:
             die(limit_message(sl["used"]))
     return st
+
+
+def _checked_state_allow(stt):
+    """Security review I1 (defence in depth): installer.json lists end up in firewall.sh unchanged when a run does not
+    ask for them — re-validate them like typed input (canonical IPv4 networks only) before they are used."""
+    allow = stt.get("allow") or {}
+    if not isinstance(allow, dict):
+        die(f"{STATE_FILE}: 'allow' is not valid — refusing to write firewall rules from it")
+    out = {}
+    for k in ("ui", "sensor", "ssh"):
+        v = allow.get(k)
+        if v is None:
+            continue
+        if not isinstance(v, list) or not all(isinstance(x, str) for x in v):
+            die(f"{STATE_FILE}: allow-list '{k}' is not a list of networks — refusing to write firewall rules from it")
+        e = _check_allow(",".join(v)) if v else None
+        if e or (v and _parse_allow(",".join(v)) != sorted(set(v)) and v != [ANY]):
+            die(f"{STATE_FILE}: allow-list '{k}' = {v!r} is not valid ({e or 'not in canonical form'}) — refusing to "
+                f"write firewall rules from it. Correct the entry in {STATE_FILE} (root only), then run the command again")
+        out[k] = v
+    return out
+
+
+def _checked_state_ports(stt):
+    ports = stt.get("ports")
+    if not isinstance(ports, dict) or not all(isinstance(ports.get(k), int) and not isinstance(ports.get(k), bool)
+                                              and 1 <= ports[k] <= 65535 for k in ("ui", "sensor", "ssh")):
+        die(f"{STATE_FILE}: 'ports' is not valid — refusing to write firewall rules from it")
+    return ports
 
 
 def _decoy_rows(st):
@@ -3307,8 +3571,13 @@ def step_add_access(st):
     keys = tuple(k for k in ("ui", "sensor", "ssh") if not _restricted(st["allow"].get(k)))
     if not keys:
         info(f"{DIM}Admin access unchanged: web UI, sensor API and host SSH are already limited.{RST}")
-        return
-    st["allow"] = ask_allowlists(st, st["ifs"][st["mgmt"]]["ip"], True, st["allow"], keys=keys)
+    else:
+        st["allow"] = ask_allowlists(st, st["ifs"][st["mgmt"]]["ip"], True, st["allow"], keys=keys)
+    # re-review R2-L3: the install's exposure checks (B9 LAN overlap, 'anyone') — the sharing is new, so every list
+    # counts as changed: interactive confirm (default no), --yes needs --accept-exposure
+    new = {k: list(st["allow"].get(k) or [ANY]) for k in ("ui", "sensor", "ssh")}
+    sharers = [x["name"] for x in st["existing"] if x.get("iface") == st["mgmt"]] + [st["new_name"]]
+    _exposure_gate(st, sharers, {}, new)
 
 
 def _add_plan(st):
@@ -3412,7 +3681,7 @@ def refresh_info(d, changes):
             txt = re.sub(rf"(?m)^({re.escape(k)}\s+).*$", lambda m: m.group(1) + v, txt)
         else:
             txt = txt.rstrip("\n") + f"\n{k:<20} {v}\n"
-    open(p, "w").write(txt)
+    write_private(p, txt)
     rows = [tuple(x) for x in re.findall(r"(?m)^(\S[^\n]*?)\s{2,}(\S[^\n]*)$", txt)]
     write_motd("manager", rows)
 
@@ -3427,10 +3696,11 @@ def _apply_decoy_change(d, st, decoys, restart):
     if os.path.isfile(p) and not os.path.islink(p):
         with open(p) as f:
             prev = f.read()
-    fw = write_firewall(d, st, decoys)
-    install_service("redpot", d, "redpot", "ReD-Pot manager + decoys", firewall=fw, start=False)
-    if fw:
-        apply_firewall(d, prev=prev, change=True)
+    with uninterruptible():             # re-review: no Ctrl-C between writing firewall.sh and applying it
+        fw = write_firewall(d, st, decoys)
+        install_service("redpot", d, "redpot", "ReD-Pot manager + decoys", firewall=fw, start=False)
+        if fw:
+            apply_firewall(d, prev=prev, change=True)
     run(["systemctl", "reload", "redpot"], check=False)
     run(f"cd {shlex.quote(d)} && docker compose -p redpot restart " + " ".join(["console"] + [x.lower() for x in restart]),
         check=False, quiet=True)
@@ -3699,6 +3969,715 @@ def export_data():
 
 
 # ----------------------------------------------------------------------------- token reset
+def _access_text(allow):
+    return ("web UI from " + ", ".join(allow.get("ui") or [ANY]) + " · sensor API from "
+            + ", ".join(allow.get("sensor") or [ANY]) + " · SSH from " + ", ".join(allow.get("ssh") or [ANY]))
+
+
+def enrolled_sensor_addrs(d):
+    """QA Q2: [(name, address)] of the enrolled remote sensors (not revoked), read-only from the console database:
+    the address a sensor enrolled from (its link to the manager, info.source_ip), else its decoy IP. None when the
+    database cannot be read (not running, dry-run)."""
+    db = _db_path("manager", d)
+    if not db:
+        return None
+    import sqlite3
+    try:
+        c = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=10)
+        try:
+            rows = c.execute("SELECT name, ip, info FROM fleet WHERE remote=1 AND revoked=0").fetchall()
+        finally:
+            c.close()
+    except sqlite3.Error:
+        return None
+    out = []
+    for name, ip, inf in rows:
+        try:
+            src = (json.loads(inf or "{}") or {}).get("source_ip")
+        except ValueError:
+            src = None
+        for a in (src, ip):
+            if isinstance(a, str) and valid_ip(a) is None and ":" not in a:
+                out.append((str(name)[:40], a))
+                break
+    return out
+
+
+def _sensor_lockout_gate(new, sensors):
+    """QA Q2: an enrolled remote sensor whose address is outside the new sensor-API list is refused by the manager:
+    it goes offline (L4 tamper alert) and its events are lost (no replay in CE) until it is allowed again.
+    Interactive: warn + confirm (default no). --yes: warn (the list was given explicitly)."""
+    if sensors is None:
+        info(f"{DIM}Could not read the enrolled remote sensors (console database) to check them against the new "
+             f"sensor-API list.{RST}")
+        return
+    if not _restricted(new["sensor"]):
+        return
+    nets = [ipaddress.ip_network(n) for n in new["sensor"]]
+    out = [(n, a) for n, a in sensors if not any(ipaddress.ip_address(a) in m for m in nets)]
+    if not out:
+        return
+    for n, a in out:
+        warn(f"remote sensor {n} ({a}) is outside the new sensor-API list: the manager will refuse it — it goes "
+             f"offline (L4 tamper alert) and its events are lost until it is allowed again.")
+    if A.yes:
+        return
+    if not ask_yes("Apply anyway, locking out " + ", ".join(n for n, _ in out) + "?", False):
+        die("cancelled — nothing changed")
+
+
+def _exposure_gate(st, sharers, old, new):
+    """Security review M1: the same S-1 H2 / B9 checks as the install review. On an address a decoy shares, a list
+    that is 'anyone', or one that contains the decoy's own LAN, shows the admin port next to the decoy to exactly
+    the attackers the decoy is for. Lists changed in this run: interactive → warn + confirm (default no); --yes →
+    refused unless --accept-exposure. Lists left as they were: warning only. sharers = names of the decoys on the
+    management address (add-decoy passes old = {} so every list counts as changed: the sharing itself is new)."""
+    if not sharers:
+        return
+    mi = st["ifs"][st["mgmt"]]
+    who = " and ".join(sharers)
+    label = {"ui": "the web UI", "sensor": "the sensor API", "ssh": "host SSH"}
+    issues = []                                            # (key, message)
+    for k in ("ui", "sensor", "ssh"):
+        if not _restricted(new[k]):
+            issues.append((k, f"{label[k]} is reachable from anywhere on {mi['ip']}, the address {who} "
+                              f"{'shares' if len(sharers) == 1 else 'share'} — a full port scan shows it."))
+    keys = {"the web UI": "ui", "the sensor API": "sensor", "host SSH": "ssh"}
+    for svc, nets, lan in allow_exposure(sharers, mi, new):
+        issues.append((keys[svc], exposure_text(svc, nets, lan, who, len(sharers))
+                       + f" Anyone there who scans {mi['ip']} sees {svc} next to the decoy."))
+    changed = [m for k, m in issues if new[k] != old.get(k)]
+    for k, m in issues:
+        warn(m + ("" if new[k] != old.get(k) else " (unchanged by this run)"))
+    if not changed:
+        return
+    hint = "Allow only your admin hosts / VPN and the remote sensors' own addresses (e.g. 10.8.0.0/24, 192.168.1.10)."
+    if A.yes:
+        if not A.accept_exposure:
+            die("refusing to expose the admin ports next to the decoy (see above). " + hint
+                + " If this is really intended, add --accept-exposure.")
+        warn("--accept-exposure: applying anyway.")
+        return
+    info(f"{DIM}{hint}{RST}")
+    if not ask_yes("Apply these lists anyway, visible next to the decoy?", False):
+        die("cancelled — nothing changed")
+
+
+def removed_nets(old, new):
+    """Entries of the old list that the new list no longer covers ('anyone' → a restricted list removes everything)."""
+    if not _restricted(new):
+        return []
+    nn = [ipaddress.ip_network(n) for n in new]
+    return [o for o in (old or [ANY]) if not any(ipaddress.ip_network(o).subnet_of(m) for m in nn
+                                                  if ipaddress.ip_network(o).version == m.version)]
+
+
+def cut_removed_sessions(st, old, new):
+    """Security review L2: the firewall keeps ESTABLISHED connections, so narrowing a list does not end console
+    sessions, sensor-API keep-alives or SSH sessions that are already open. With the conntrack tool, delete the
+    tracked connections to the narrowed web UI / sensor API port whose source the new list no longer allows (never the
+    manager's own address; -d <management IP>, as listed). Host SSH is NEVER cut automatically (re-review R2-L1:
+    inside tmux/screen the admin's own session may come from an address this run cannot know): the output names the
+    SSH sources that stay connected. Without conntrack, say plainly that connections stay open until they close."""
+    mi = st["ifs"][st["mgmt"]]["ip"]
+    port = {"ui": st["ports"]["ui"], "sensor": st["ports"]["sensor"]}
+    if removed_nets(old["ssh"], new["ssh"]):
+        info(f"{DIM}Host SSH: sessions that are already open stay open (never cut automatically, so yours is safe). "
+             f"See them with: ss -tn state established '( sport = :{st['ports']['ssh'] if st.get('move_ssh') else 22} )'"
+             f" — end one with: sudo ss -K dst <address> sport = :<port>{RST}")
+    keys = [k for k in ("ui", "sensor") if removed_nets(old[k], new[k])]
+    if not keys:                    # QA Q4: nothing was removed (only widened / unchanged): nothing to say or cut
+        return
+    tool = shutil.which("conntrack")
+    if not tool:
+        info(f"{DIM}Web UI / sensor API connections that are already open from addresses you removed stay open until "
+             f"they close (the firewall keeps established connections; the conntrack tool is not installed to cut "
+             f"them). To end them now: sudo systemctl restart redpot.{RST}")
+        return
+    if A.dry_run:
+        info(f"[dry-run] would cut open connections to port(s) {', '.join(str(port[k]) for k in keys)} from addresses "
+             f"no longer allowed (conntrack -D)")
+        return
+    nets = {k: [ipaddress.ip_network(n) for n in new[k]] for k in keys}
+    cut = 0
+    for k in keys:
+        r = run([tool, "-L", "-p", "tcp", "--orig-port-dst", str(port[k])], check=False, capture=True)
+        srcs = set()
+        for line in (r.stdout or "").splitlines():
+            m = re.search(r"\bsrc=(\S+) dst=(\S+) sport=\d+ dport=(\d+)", line)
+            if not m or m.group(2) != mi or m.group(3) != str(port[k]):
+                continue
+            a = valid_ip(m.group(1)) is None and _client_addr(m.group(1))
+            if not a or a.version != 4 or str(a) == mi:
+                continue
+            if not any(a in n for n in nets[k]):
+                srcs.add(str(a))
+        for s in sorted(srcs):
+            if run([tool, "-D", "-p", "tcp", "-s", s, "-d", mi, "--orig-port-dst", str(port[k])], check=False,
+                   quiet=True).returncode == 0:
+                cut += 1
+    info(f"{DIM}Open connections from removed addresses: {cut} source(s) cut (conntrack).{RST}" if cut else
+         f"{DIM}No open connections from removed addresses.{RST}")
+
+
+def _apply_access(d, st, decoys):
+    """set-access: write + apply firewall.sh for the new lists. Security review L1: if that fails, firewall.sh (and
+    the unit) on disk go back to the previous version before the error ends the run — there is no new compose to
+    match (unlike add-decoy), so disk, installer.json (saved only after success) and the rules in effect agree, and
+    the next start does not apply lists the admin was told had failed."""
+    p = os.path.join(d, FIREWALL)
+    prev = None
+    if os.path.isfile(p) and not os.path.islink(p):
+        with open(p) as f:
+            prev = f.read()
+    with uninterruptible():             # re-review: no Ctrl-C between writing firewall.sh and applying it
+        fw = write_firewall(d, st, decoys)
+        install_service("redpot", d, "redpot", "ReD-Pot manager + decoys", firewall=fw, start=False)
+        if not fw:
+            return
+        try:
+            apply_firewall(d, prev=prev, change=True)
+        except SystemExit:
+            if prev is not None:
+                write_private(p, prev, 0o700)
+            elif os.path.lexists(p):
+                os.remove(p)
+            install_service("redpot", d, "redpot", "ReD-Pot manager + decoys", firewall=prev is not None, start=False)
+            print(f"  {DIM}{p} on disk is the previous version again; {STATE_FILE} is unchanged.{RST}")
+            raise
+
+
+def set_access():
+    """B5 (CE 1.0.1): change the admin allow-lists (web UI, sensor API, host SSH) of a manager install after the
+    install — e.g. a remote sensor got a new address — without reinstalling (which would regenerate persona +
+    baits). Same questions and checks as the install; writes firewall.sh for the current decoy set and puts it in
+    effect with the add/remove-decoy safety net (previous rules restored, else the stack stopped: never decoys
+    without a firewall). No lock-out: the current SSH client is always allowed on host SSH and established
+    connections are kept. Idempotent: unchanged lists change nothing.
+    Unattended: --yes plus at least one of --allow-ui / --allow-sensor / --allow-ssh (the others stay)."""
+    d = A.dir or "/opt/redpot/manager"
+    st = _add_context(d, slots=False, purpose="set-access")
+    mi = st["ifs"][st["mgmt"]]["ip"]
+    old = {k: list(st["allow"].get(k) or [ANY]) for k in ("ui", "sensor", "ssh")}
+    banner("Admin access of this ReD-Pot manager")
+    info(f"Now: {_access_text(old)}")
+    flags = {"ui": A.allow_ui, "sensor": A.allow_sensor, "ssh": A.allow_ssh}
+    keys = tuple(k for k in ("ui", "sensor", "ssh") if flags[k] is not None) if A.yes else ("ui", "sensor", "ssh")
+    if not keys:
+        die("name the lists to change: sudo ./install.sh set-access --yes --allow-sensor 10.0.5.0/24 "
+            "(also --allow-ui, --allow-ssh; 0.0.0.0/0 = anyone)")
+    shared = any(x.get("iface") == st["mgmt"] for x in st["existing"])
+    st["allow"] = ask_allowlists(st, mi, shared, old, keys=keys)
+    new = {k: list(st["allow"].get(k) or [ANY]) for k in ("ui", "sensor", "ssh")}
+    if new == old:
+        info("Admin access unchanged — nothing to do.")
+        return
+    for k, label in (("ui", "Web UI"), ("sensor", "Sensor API"), ("ssh", "Host SSH")):
+        if new[k] != old[k]:
+            info(f"{label:<11} {', '.join(old[k])}  →  {BOLD}{', '.join(new[k])}{RST}")
+    _exposure_gate(st, [x["name"] for x in st["existing"] if x.get("iface") == st["mgmt"]] if shared else [], old, new)
+    if new["sensor"] != old["sensor"]:
+        _sensor_lockout_gate(new, enrolled_sensor_addrs(d))
+    ca = _client_addr(ssh_session_ip_client())
+    if ca is not None and ca.version == 4 and _restricted(new["ui"]) and \
+            not any(ca in ipaddress.ip_network(n) for n in new["ui"]):
+        warn(f"your current address {ca} is not in the new web UI list: this browser location cannot open the console")
+    if new["ssh"] != old["ssh"] and _restricted(new["ssh"]):
+        info(f"{DIM}Your current SSH client{(' ' + str(ca)) if ca else ''} stays allowed and this session stays open."
+             f"{RST}")
+    if not ask_yes("Apply the new allow-lists now?", True, flag=True if A.yes else None):
+        die("cancelled — nothing changed")
+    global EXECUTING
+    EXECUTING = True
+    decoys = _decoy_rows(st)
+    if decoys or any(_restricted(new[k]) for k in new):
+        preflight_firewall(list(dict.fromkeys(x["iface"] for x in decoys)))
+    _apply_access(d, st, decoys)
+    save_state(d, st)
+    cut_removed_sessions(st, old, new)
+    refresh_info(d, {"Admin access": _access_text(new)})
+    banner("Admin access updated")
+    info(_access_text(new))
+    info(f"{DIM}Saved in {d}/{STATE_FILE} and INSTALL-INFO.txt; the firewall is in effect now and at every start.{RST}\n")
+
+
+# ----------------------------------------------------------------------------- update in place (RC-35)
+UPDATE_COMPAT = {("1.0.0", "1.0.1")}      # installed -> this installer; same rpot.json schema (2) and DB, no migration
+UPDATE_WAIT = 90                           # s: console answering / decoys running after the restart
+UNIT_FILE = "/etc/systemd/system/{}.service"
+
+
+IMAGE_TAG_RE = r"rpot:(\d+\.\d+\.\d+)(?:-hotfix\d+)?"   # release, or a 1.0.0 hotfix image (RC-36: rpot:1.0.0-hotfix1)
+
+
+def installed_images(d):
+    """Every image tag in an install's docker-compose.yml, in order, without duplicates ([] if absent)."""
+    p = os.path.join(d, "docker-compose.yml")
+    if not os.path.isfile(p):
+        return []
+    with open(p) as f:
+        tags = re.findall(r"(?m)^\s*image:\s*(\S+)\s*$", f.read())
+    return list(dict.fromkeys(tags))
+
+
+def installed_version(d):
+    """Version of an install from its compose image tags: rpot:X.Y.Z, or rpot:X.Y.Z-hotfixN (the hotfix of X.Y.Z,
+    counted as X.Y.Z). None if there is no image, an unknown image, or more than one base version."""
+    tags = installed_images(d)
+    vers = set()
+    for t in tags:
+        m = re.fullmatch(IMAGE_TAG_RE, t)
+        if not m:
+            return None
+        vers.add(m.group(1))
+    return vers.pop() if len(vers) == 1 else None
+
+
+def hotfix_images(tags):
+    """Tags of a hotfix image: the -hotfixN tag, or the io.redside.hotfix label (the hotfix's derived image)."""
+    out = [t for t in tags if re.fullmatch(r"rpot:\d+\.\d+\.\d+-hotfix\d+", t)]
+    if not A.dry_run:
+        for t in tags:
+            if t in out:
+                continue
+            r = run(["docker", "image", "inspect", "-f", '{{index .Config.Labels "io.redside.hotfix"}}', t], check=False,
+                    capture=True)
+            v = (r.stdout or "").strip() if r.returncode == 0 else ""
+            if v and v != "<no value>":
+                out.append(t)
+    return out
+
+
+def _detect_install():
+    """('manager' | 'sensor', dir) from the files an install leaves: rpot.json = manager, conf/sensor.json = sensor
+    (a 1.0.0 sensor has no installer.json)."""
+    cands = [A.dir] if A.dir else list(INSTALL_DIRS)
+    found = []
+    for d in cands:
+        if os.path.isfile(os.path.join(d, "rpot.json")):
+            found.append(("manager", d))
+        elif os.path.isfile(os.path.join(d, "conf", "sensor.json")):
+            found.append(("sensor", d))
+    if not found:
+        die("no ReD-Pot install found" + (f" in {A.dir}" if A.dir else " (/opt/redpot/manager, /opt/redpot/sensor)")
+            + " — nothing to update")
+    if len(found) > 1:
+        die("a manager AND a sensor install are on this server: choose one with --dir")
+    return found[0]
+
+
+def _unit_name(kind):
+    return "redpot" if kind == "manager" else "redpot-sensor"
+
+
+def _db_path(kind, d):
+    """Host path of the console database (Docker volume <project>_console-data); None for a sensor / not found."""
+    if kind != "manager" or A.dry_run:
+        return None
+    r = run(["docker", "volume", "inspect", "-f", "{{.Mountpoint}}", "redpot_console-data"], check=False, capture=True)
+    mp = (r.stdout or "").strip() if r.returncode == 0 else ""
+    p = os.path.join(mp, "rpot.db") if mp else ""
+    return p if p and os.path.isfile(p) else None
+
+
+UPDATE_BACKUP_ROOT = "/var/backups/redpot"   # root 0700, OUTSIDE the install dir (rpotctl compose chowns that to 10001)
+EDITION = "community"                        # this installer's edition (update never crosses editions)
+
+
+def _backup_root():
+    r = UPDATE_BACKUP_ROOT
+    if os.path.islink(r):
+        die(f"{r} is a symlink — refusing to keep backups there")
+    os.makedirs(r, mode=0o700, exist_ok=True)
+    st = os.lstat(r)
+    if st.st_uid != 0 and os.geteuid() == 0:
+        die(f"{r} is not owned by root — refusing to keep backups there")
+    os.chmod(r, 0o700)
+    return r
+
+
+def _marker(kind):
+    """Update in progress (security review R3-L5): written before the first change, removed when the update or its
+    rollback is complete. Root-only, next to the backups (never in the 10001-owned install dir)."""
+    return os.path.join(UPDATE_BACKUP_ROOT, f"update-in-progress-{kind}.json")
+
+
+def _update_files(kind, d):
+    """(key in the backup, live path) of every file update rewrites."""
+    unit = _unit_name(kind)
+    out = [("docker-compose.yml", os.path.join(d, "docker-compose.yml")), (FIREWALL, os.path.join(d, FIREWALL)),
+           (STATE_FILE, os.path.join(d, STATE_FILE)), (f"{unit}.service", UNIT_FILE.format(unit))]
+    out.append(("rpot.json", os.path.join(d, "rpot.json")) if kind == "manager" else
+               ("sensor.json", os.path.join(d, "conf", "sensor.json")))
+    return out
+
+
+def backup_install(kind, d, cur):
+    """Before anything else: a consistent copy of the database (sqlite online backup API — never cp of a live WAL
+    database) and of every file the update rewrites, with each file's owner and mode (meta.json), in
+    /var/backups/redpot/<time>-<kind>-<version>/ (root 0700, files 0600)."""
+    b = os.path.join(UPDATE_BACKUP_ROOT, f"{time.strftime('%Y%m%dT%H%M%S')}-{kind}-{cur}")
+    files = _update_files(kind, d)
+    if A.dry_run:
+        info(f"[dry-run] would back up to {b}/: " + ", ".join(k for k, p in files if os.path.exists(p))
+             + (", the console database (sqlite backup API)" if kind == "manager" else ""))
+        return b
+    _backup_root()
+    os.makedirs(b, mode=0o700)
+    os.chmod(b, 0o700)
+    meta = {}
+    for key, src in files:
+        if os.path.isfile(src) and not os.path.islink(src):
+            st = os.lstat(src)
+            with open(src) as f:
+                write_private(os.path.join(b, key), f.read())
+            meta[key] = {"path": src, "uid": st.st_uid, "gid": st.st_gid, "mode": stat.S_IMODE(st.st_mode)}
+        elif not os.path.lexists(src):
+            meta[key] = {"path": src, "absent": True}
+    db = _db_path(kind, d)
+    if kind == "manager":
+        if not db:
+            die(f"the console database was not found (Docker volume redpot_console-data) — not updating. Backup of the "
+                f"files so far: {b}")
+        import sqlite3
+        dst = os.path.join(b, "rpot.db")
+        fd = os.open(dst, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        os.close(fd)
+        src_c, dst_c = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=30), sqlite3.connect(dst)
+        try:
+            src_c.backup(dst_c)
+            ok = dst_c.execute("PRAGMA quick_check").fetchone()[0] == "ok"
+        finally:
+            src_c.close()
+            dst_c.close()
+        if not ok:
+            die(f"the database backup in {b} failed its integrity check — not updating")
+    write_private(os.path.join(b, "meta.json"), json.dumps(meta, indent=1))
+    info(f"Backup: {b}" + (" (database + configuration)" if kind == "manager" else " (configuration)"))
+    return b
+
+
+def _update_manager(d):
+    """New compose (new image), firewall.sh with the make-before-break apply, unit; apply; restart; health."""
+    st = _add_context(d, slots=False, guard=False)     # U-1: this run wrote the marker itself
+    mi = st["ifs"][st["mgmt"]]["ip"]
+    ctl(d, "compose", "-d", "/d", "--ui-bind", mi)
+    _marker_seen("manager", d)
+    p = os.path.join(d, FIREWALL)
+    prev = open(p).read() if os.path.isfile(p) and not os.path.islink(p) else None
+    decoys = _decoy_rows(st)
+    fw = write_firewall(d, st, decoys)
+    _marker_seen("manager", d)
+    install_service("redpot", d, "redpot", "ReD-Pot manager + decoys", firewall=fw, start=False)
+    _marker_seen("manager", d)
+    if fw:
+        apply_firewall(d, prev=prev, change=True)
+    run(["systemctl", "restart", "redpot"], check=True)
+    ok = wait_https(mi, st["ports"]["ui"], UPDATE_WAIT)
+    return self_test("redpot", decoys, d=d) and ok
+
+
+def _sensor_running(d, secs=UPDATE_WAIT):
+    if A.dry_run:
+        return True
+    for _ in range(secs // 3):
+        r = run(f"cd {shlex.quote(d)} && docker compose -p redpot-sensor ps --status running -q", check=False,
+                capture=True)
+        if len((r.stdout or "").split()) >= 2:            # relay + decoy
+            return firewall_in_effect(d) is not False
+        time.sleep(3)
+    return False
+
+
+def _update_sensor(d, cur):
+    """Same containers, new image: only the image tag in docker-compose.yml changes (the sensor's install choices
+    are not stored, so compose and firewall.sh are kept as they are); restart; health."""
+    p = os.path.join(d, "docker-compose.yml")
+    txt = open(p).read()
+    new = re.sub(rf"(?m)^(\s*image:\s*)rpot:{re.escape(cur)}(?:-hotfix\d+)?\s*$", lambda m: m.group(1) + IMAGE, txt)
+    if A.dry_run:
+        info(f"[dry-run] would set image {IMAGE} in {p}")
+    else:
+        write_private(p, new)
+        _marker_seen("sensor", d)
+    run(["systemctl", "restart", "redpot-sensor"], check=True)
+    return _sensor_running(d)
+
+
+def _restore_file(key, m, b):
+    """One file back as it was: content, owner and mode from meta.json (security review R3-M1: rpot.json and
+    conf/sensor.json are read by uid 10001). Only written when it differs."""
+    dst = m["path"]
+    if os.path.islink(dst):
+        raise OSError(f"{dst} is a symlink — refusing to restore through it")
+    if m.get("absent"):
+        if os.path.lexists(dst):
+            os.remove(dst)                         # there was none before the update
+        return
+    with open(os.path.join(b, key)) as f:
+        want = f.read()
+    cur = None
+    if os.path.isfile(dst):
+        with open(dst) as f:
+            cur = f.read()
+    st = os.lstat(dst) if os.path.lexists(dst) else None
+    if cur != want or st is None or (st.st_uid, st.st_gid, stat.S_IMODE(st.st_mode)) != (m["uid"], m["gid"], m["mode"]):
+        write_private(dst, want, m["mode"], owner=(m["uid"], m["gid"]))   # owner + mode set before the rename
+
+
+def _rollback(kind, d, b, cur, new_fw):
+    """Back to the previous version: files from the backup (owner and mode kept), the old unit (its start applies the
+    old firewall.sh with the decoys stopped, then starts the old image), leftovers of the new rule generation are
+    dropped, and the service must really be back (console answering / relay + decoy running). Returns a list of
+    problems (empty = rolled back)."""
+    unit = _unit_name(kind)
+    bad = []
+    if A.dry_run:
+        info(f"[dry-run] would restore the files from {b}, restart {unit} with image rpot:{cur}")
+        return bad
+    try:
+        with open(os.path.join(b, "meta.json")) as f:
+            meta = json.load(f)
+    except (OSError, ValueError) as e:
+        return [f"the backup {b} cannot be read ({e})"]
+    allowed = dict(_update_files(kind, d))
+    for key, m in meta.items():
+        if not isinstance(m, dict) or allowed.get(key) != m.get("path"):
+            bad.append(f"meta.json entry {key!r} is not one of this install's files — skipped")
+            continue
+        try:
+            _restore_file(key, m, b)
+        except (OSError, KeyError) as e:
+            bad.append(f"could not restore {m.get('path', key)}: {e}")
+    run(["systemctl", "daemon-reload"], check=False)
+    if run(["systemctl", "restart", unit], check=False).returncode != 0:
+        bad.append(f"systemctl restart {unit} failed (see: journalctl -u {unit})")
+    if new_fw:                                     # new rule generation left over? (the old script knows REDPOT-* only)
+        tmp = os.path.join(d, FIREWALL + ".new-gen")
+        write_private(tmp, new_fw, 0o700)
+        try:
+            run(["/bin/sh", tmp, "drop", "-B"], check=False, quiet=True, new_session=True)
+        finally:
+            os.remove(tmp)
+    if kind == "manager":
+        try:
+            with open(os.path.join(b, STATE_FILE)) as f:
+                stt = json.load(f)
+            if not wait_https(stt["mgmt_ip"], int(stt["ports"]["ui"]), UPDATE_WAIT):
+                bad.append(f"the console does not answer on {stt['mgmt_ip']}:{stt['ports']['ui']} "
+                           f"(see: sudo docker compose -p redpot logs console)")
+        except (OSError, ValueError, KeyError, TypeError) as e:
+            bad.append(f"cannot check the console ({e})")
+    elif not _sensor_running(d):
+        bad.append("the sensor's relay / decoy containers are not running (see: sudo docker compose -p redpot-sensor "
+                   "logs)")
+    if os.path.exists(os.path.join(d, FIREWALL)) and firewall_in_effect(d) is False:
+        bad.append(f"the firewall is NOT in effect (check: sh {d}/{FIREWALL} check)")
+    return bad
+
+
+def _installed_edition(img):
+    """Edition of the installed image: its io.redside.edition label, else rpot/common/edition.py inside it
+    (1.0.0 images have no label)."""
+    if A.dry_run:
+        info(f"[dry-run] would check that {img} is the {EDITION} edition")
+        return EDITION
+    r = run(["docker", "image", "inspect", "-f", '{{index .Config.Labels "io.redside.edition"}}', img], check=False,
+            capture=True)
+    v = (r.stdout or "").strip() if r.returncode == 0 else ""
+    if v and v != "<no value>":
+        return v
+    r = run(["timeout", "60", "docker", "run", "--rm", "--network", "none", "--read-only", "--cap-drop", "ALL",
+             "--security-opt", "no-new-privileges", "--pids-limit", "64", "--memory", "128m", "--user", "10001:10001",
+             "--entrypoint", "python", img, "-c", "from rpot.common.edition import EDITION; print(EDITION)"],
+            check=False, capture=True)
+    return (r.stdout or "").strip() if r.returncode == 0 else ""
+
+
+class _QuietOnHangup:
+    """stdout/stderr wrapper for the critical part (security review R3-L1): after a dropped SSH session a print to the
+    dead terminal raises OSError (EIO); that must not abort the update or its rollback."""
+
+    def __init__(self, s):
+        self._s = s
+
+    def write(self, t):
+        try:
+            return self._s.write(t)
+        except OSError:
+            return len(t)
+
+    def flush(self):
+        try:
+            self._s.flush()
+        except OSError:
+            pass
+
+    def __getattr__(self, n):
+        return getattr(self._s, n)
+
+
+def _file_hashes(kind, d):
+    """sha256 of every file update rewrites (None = absent)."""
+    import hashlib
+    out = {}
+    for key, p in _update_files(kind, d):
+        try:
+            with open(p, "rb") as f:
+                out[key] = hashlib.sha256(f.read()).hexdigest()
+        except FileNotFoundError:
+            out[key] = None
+    return out
+
+
+def _marker_seen(kind, d):
+    """Record the current version of every file in the update marker (R4-L2): on resume, a file may only be in a
+    state this update produced (its backup or a version written by an update step), never a later admin change."""
+    m = _marker(kind)
+    if A.dry_run or not os.path.isfile(m):
+        return
+    with open(m) as f:
+        mk = json.load(f)
+    seen = mk.setdefault("seen", {})
+    for key, h in _file_hashes(kind, d).items():
+        if h not in seen.setdefault(key, []):
+            seen[key].append(h)
+    write_private(m, json.dumps(mk))
+
+
+def marker_guard(kind="manager"):
+    """add-decoy / remove-decoy / set-access: never on a half-updated install (R4-L2)."""
+    if os.path.isfile(_marker(kind)):
+        die(f"an update of this {kind} did not finish ({_marker(kind)}). Run sudo ./install.sh update first: it checks "
+            f"the install and offers to roll the interrupted update back.")
+
+
+def _resume_interrupted(kind, d):
+    """A previous update was cut off (SIGKILL, power loss): roll it back from its backup first (never 'already up to
+    date' on a half-updated install)."""
+    m = _marker(kind)
+    if not os.path.isfile(m) or os.path.islink(m):
+        return
+    try:
+        with open(m) as f:
+            mk = json.load(f)
+        b, frm = mk["backup"], mk["from"]
+    except (OSError, ValueError, KeyError) as e:
+        die(f"{m} (an interrupted update) cannot be read ({e}) — check the install, then remove that file")
+    if not os.path.realpath(b).startswith(os.path.realpath(UPDATE_BACKUP_ROOT) + os.sep):
+        die(f"{m} names a backup outside {UPDATE_BACKUP_ROOT} — refusing to use it")
+    if os.path.realpath(str(mk.get("dir") or "")) != os.path.realpath(d):
+        die(f"{m} belongs to an update of {mk.get('dir')!r}, not of {d} — not rolling back. If that install is gone, "
+            f"remove {m}.")
+    seen = mk.get("seen") or {}
+    changed = [p for key, p in _update_files(kind, d) if _file_hashes(kind, d).get(key) not in (seen.get(key) or [])]
+    if changed:
+        die(f"an update from {frm} to {mk.get('to')} (started {mk.get('started')}) did not finish, but these files were "
+            f"changed AFTER it: {', '.join(changed)}. Not rolling back automatically (it would undo those changes). "
+            f"If the install works as it is, remove {m}; the backup stays in {b}.")
+    warn(f"an update from {frm} to {mk.get('to')} (started {mk.get('started')}) did not finish; its backup is {b}")
+    if A.dry_run:
+        info(f"[dry-run] would roll back from {b}")
+        return
+    if not ask_yes(f"Roll the interrupted update back to {frm} now?", False,
+                   flag=True if getattr(A, "resume_rollback", False) else None):
+        die(f"not rolled back. To roll back: sudo ./install.sh update --resume-rollback (with --yes for unattended "
+            f"runs). If the install works as it is, remove {m} instead.")
+    with uninterruptible():
+        p = os.path.join(d, FIREWALL)
+        new_fw = open(p).read() if os.path.isfile(p) and not os.path.islink(p) else None
+        bad = _rollback(kind, d, b, frm, new_fw)
+    if bad:
+        die("the interrupted update could NOT be rolled back completely: " + "; ".join(bad) + f". Backup: {b}.")
+    os.remove(m)
+    info(f"rolled back to {frm} — continuing with the update")
+
+
+def update():
+    """sudo ./install.sh update: in-place update of a manager or sensor install to this installer's version,
+    keeping persona, baits, admin token, enrolled sensors and the database. Backup first; on any failure the
+    previous image, configuration, unit and firewall come back."""
+    global EXECUTING
+    kind, d = _detect_install()
+    _resume_interrupted(kind, d)                   # R3-L5: a half-done update is rolled back before anything else
+    cur = installed_version(d)
+    if cur is None:
+        die(f"cannot tell the installed version from {d}/docker-compose.yml (no single rpot:X.Y.Z image) — not updating")
+    if cur == VERSION:
+        info(f"ReD-Pot {kind} in {d} is already up to date ({VERSION}).")
+        return
+    if (cur, VERSION) not in UPDATE_COMPAT:
+        die(f"no in-place update from {cur} to {VERSION} (supported: "
+            + ", ".join(f"{a} → {b}" for a, b in sorted(UPDATE_COMPAT)) + "). Uninstall, then install "
+            f"{VERSION} (new persona, baits and admin token).")
+    if kind == "manager":
+        _existing_manager(d)                       # rpot.json schema 2, host-network install (refuses otherwise)
+    banner(f"Update ReD-Pot {kind} {cur} → {VERSION}")
+    info(f"{d}: persona, baits, admin token, " + ("enrolled sensors and the database" if kind == "manager"
+                                                     else "enrollment") + " are kept. A backup is made first; if the "
+         "update fails, the previous version is restored.")
+    if not ask_yes("Update now?", True, flag=True if A.yes else None):
+        die("cancelled — nothing changed")
+    old_imgs = installed_images(d)
+    old_img = next((t for t in old_imgs if t == f"rpot:{cur}"), old_imgs[0])
+    hot = hotfix_images(old_imgs)
+    if hot:
+        info(f"The hotfix {', '.join(hot)} on this {kind} is superseded by {VERSION} (its fixes are part of it).")
+    for t in old_imgs:
+        if not A.dry_run and run(["docker", "image", "inspect", t], check=False, capture=True).returncode != 0:
+            die(f"the running image {t} is not on this host, so a failed update could not be rolled back — "
+                f"not updating")
+    ed = _installed_edition(old_img)               # R3-L5: never cross editions
+    if ed != EDITION:
+        die(f"the installed image {old_img} is the {ed or 'unknown'} edition, this installer is the {EDITION} edition — "
+            f"not updating (use the installer of the installed edition)")
+    b = backup_install(kind, d, cur)               # Ctrl-C up to here: nothing of the install has changed
+    ensure_docker()
+    ensure_image()                                 # pull + verify (src_hash label), or a local build
+    p = os.path.join(d, FIREWALL)
+    out, err = sys.stdout, sys.stderr
+    with uninterruptible():                        # like set-access: no Ctrl-C / SIGHUP halfway
+        EXECUTING = True
+        sys.stdout, sys.stderr = _QuietOnHangup(out), _QuietOnHangup(err)
+        if not A.dry_run:
+            write_private(_marker(kind), json.dumps({"from": cur, "to": VERSION, "backup": b, "dir": d,
+                                                     "started": time.strftime("%Y-%m-%d %H:%M:%S"),
+                                                     "seen": {k: [h] for k, h in _file_hashes(kind, d).items()}}))
+        ok, why = False, ""
+        try:
+            ok = _update_manager(d) if kind == "manager" else _update_sensor(d, cur)
+        except SystemExit:
+            ok = False
+        except BaseException as e:                 # R3-L1: any error (I/O on a dead terminal, a bug) → roll back
+            ok, why = False, f" ({type(e).__name__}: {str(e)[:200]})"
+        if not ok:
+            new_fw = open(p).read() if os.path.isfile(p) and not os.path.islink(p) else None
+            warn(f"the update to {VERSION} failed{why} — rolling back to {cur}")
+            bad = _rollback(kind, d, b, cur, new_fw)
+            if not bad and not A.dry_run:
+                os.remove(_marker(kind))           # incomplete: the marker stays, the next run retries the rollback
+            if bad:
+                die(f"ROLLBACK INCOMPLETE — this host needs attention: " + "; ".join(bad)
+                    + f". Everything from before the update is in {b} (database: rpot.db, made with the sqlite backup "
+                      f"API; owners and modes in meta.json). Fix the cause, then run sudo ./install.sh update again: it "
+                      f"retries the rollback first. By hand: copy the files back (same owner and mode), then sudo "
+                      f"systemctl restart {_unit_name(kind)}.")
+            back = ", ".join(old_imgs)             # U-2: the images really restored (e.g. rpot:1.0.0-hotfix1, rpot:1.0.0)
+            die(f"the update failed and was ROLLED BACK: {kind} runs {cur} again (image{'s' if len(old_imgs) > 1 else ''} "
+                f"{back}) with its previous "
+                f"configuration, unit and firewall rules. The database was not touched by the failed update; the "
+                f"backup made before it stays in {b}.")
+        if not A.dry_run:
+            os.remove(_marker(kind))
+        sys.stdout, sys.stderr = out, err
+    if kind == "manager":
+        refresh_info(d, {"Version": VERSION})
+    banner(f"ReD-Pot {kind} updated to {VERSION}")
+    info(f"Backup of the previous version: {b} (delete it when you no longer need it).")
+    info(f"{DIM}The previous image(s) {', '.join(old_imgs)} are kept for now; remove them later with: sudo docker image rm "
+         f"{' '.join(old_imgs)}{RST}\n")
+
+
 def reset_token():
     """New web-UI admin token (and with --wall a new kiosk link). Old token and every logged-in
     browser stop working at once: session cookies are signed with a key derived from the token."""
@@ -3747,7 +4726,7 @@ def reset_token():
         txt = re.sub(r"(?m)^(Admin token\s+)\S+", lambda m_: m_.group(1) + tok, txt)
         if A.wall and base:
             txt = re.sub(r"(?m)^(Wall \(read-only\)\s+)\S+", lambda m_: m_.group(1) + f"{base}/wall?k={cfg['console']['wall_token']}", txt)
-        open(info_p, "w").write(txt)
+        write_private(info_p, txt)
     ok = base is None or _test_ifaces() is not None or wait_https(urllib_host(base), int(base.rsplit(":", 1)[1]), 60)
     print(f"\n  {BOLD}New admin token{RST}  {GREEN}{tok}{RST}")
     if cfg["console"].get("wall_allow"):
@@ -3798,14 +4777,16 @@ def main():
                "  JSON export of incidents + alert records for those UTC days (at most 366), from the running\n"
                "  manager. Default file ./redpot-export-FROM_TO.json, mode 0600; an existing file is kept unless\n"
                "  --force (which only replaces your own regular file). Too large: narrow the date range.")
-    ap.add_argument("mode", nargs="?", choices=["manager", "sensor", "add-decoy", "remove-decoy", "uninstall",
-                                                "reset-token", "geoip", "export"])
+    ap.add_argument("mode", nargs="?", choices=["manager", "sensor", "add-decoy", "remove-decoy", "set-access",
+                                                "update", "uninstall", "reset-token", "geoip", "export"])
     ap.add_argument("target", nargs="?", help="remove-decoy: name of the decoy")
     ap.add_argument("--wall", action="store_true", help="reset-token: also issue a new read-only wall link")
     ap.add_argument("--token", help="reset-token: use this token instead of a random one (≥16 chars)")
     ap.add_argument("--wall-allow", help="reset-token: wall screens allowed from these IPs/networks only "
                                           "(comma separated; 'none' = any)")
     ap.add_argument("--keep-data", action="store_true", help="uninstall: keep database, logs and config")
+    ap.add_argument("--resume-rollback", action="store_true",
+                    help="update: roll back an interrupted update without asking (--yes alone does not)")
     ap.add_argument("--purge-image", action="store_true", help="uninstall: also delete the Docker image")
     ap.add_argument("--ssh-port", type=int, help="move host SSH to this port instead of a random one")
     ap.add_argument("--dir")
@@ -3830,11 +4811,15 @@ def main():
     ap.add_argument("--geoip", choices=["yes", "no"])
     ap.add_argument("--no-ssh-move", action="store_true", help="never touch the host SSH daemon")
     ap.add_argument("--allow-ui", help="networks allowed to open the web UI (comma separated; 0.0.0.0/0 = any). "
-                                       "Required with --yes when a decoy is on the management interface")
+                                       "Required with --yes when a decoy is on the management interface; set-access: change it later")
     ap.add_argument("--allow-sensor", help="networks allowed to reach the sensor API (remote sensors); "
                                            "required with --yes when a decoy is on the management interface")
     ap.add_argument("--allow-ssh", help="networks allowed to use host SSH (your current client is always added); "
                                         "required with --yes when a decoy is on the management interface")
+    ap.add_argument("--accept-exposure", action="store_true",
+                    help="set-access / add-decoy, unattended: apply an allow-list that is open to anyone, or that "
+                         "contains a decoy's own LAN, on an address a decoy shares (the admin port becomes visible "
+                         "next to it)")
     ap.add_argument("--close-other-services", action="store_true",
                     help="unattended: accept that host services listening on the management interface become "
                          "unreachable there when a decoy shares it (they are listed first)")
@@ -3859,10 +4844,13 @@ def main():
         ("manager", "Manager + decoy sensors on this server (standalone)"),
         ("sensor", "Sensor only — join an existing ReD-Pot manager"),
         ("add-decoy", "Add a decoy on a free network interface of this install — keeps every planted bait"),
+        ("update", f"Update this install to {VERSION} in place (keeps persona, baits, token, sensors, database)"),
+        ("set-access", "Change who may reach the web UI, the sensor API and host SSH (allow-lists)"),
         ("reset-token", "Reset the web console admin token (lost or leaked)"),
         ("uninstall", "Uninstall ReD-Pot (restores host SSH to port 22)")])
     {"manager": install_manager, "sensor": install_sensor, "uninstall": uninstall, "reset-token": reset_token,
-     "geoip": geoip_later, "add-decoy": add_decoy, "remove-decoy": remove_decoy, "export": export_data}[mode]()
+     "geoip": geoip_later, "add-decoy": add_decoy, "remove-decoy": remove_decoy, "set-access": set_access, "update": update,
+     "export": export_data}[mode]()
 
 
 if __name__ == "__main__":

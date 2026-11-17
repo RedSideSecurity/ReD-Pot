@@ -287,7 +287,7 @@ async function loadWorld() {
   $("#wfeed").innerHTML = d.feed.map(e => `<div class="row click" data-ip="${esc(e.src_ip)}"><span>${lvs(e.level)}</span>
     <span>${flag(e.cc)} <span class="mono">${esc(e.src_ip)}</span><br><span class="muted">${esc(e.desc)}</span></span><span class="age ${wmAge(e.ts) < 300e3 ? "live" : ""}">${ago(e.ts)}</span></div>`).join("") || `<div class="empty">—</div>`;
   if (!st.wall) $$("#wfeed [data-ip]").forEach(r => r.onclick = () => openHost(r.dataset.ip));
-  $("#wfeedinfo").textContent = `newest first · refreshes every 5 s`;
+  $("#wfeedinfo").textContent = `L${d.feed_level || 2}+ · newest first, newest L4+ always kept · refreshes every 5 s`;
   wmNotice(d.notice);
   wmSiteInfo(d);
   $("#wattr").textContent = d.geo_sources.length ? `IP geolocation by DB-IP (db-ip.com), CC BY 4.0 · ${d.geo_sources.join(", ")}` :

@@ -705,6 +705,7 @@ class TestApp(unittest.TestCase):
         self.assertIn("nogeo", n["reasons"])
         self.assertGreaterEqual(n["internal_sources"], 1)
         self.s.post("/api/ingest", json={"events": [ev("auth.failed", src="203.0.113.7")]}, headers=FS)
+        self.app.engine._memo.clear()      # the API reuses a map result for up to Engine.MEMO_TTL s (RC-35 B7)
         n = c.get("/api/worldmap").get_json()["notice"]
         self.assertNotIn("internal_only", n["reasons"])            # a public attacker is on the map now
         self.assertEqual(n["reasons"], ["nogeo"])

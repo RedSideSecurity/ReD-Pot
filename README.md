@@ -14,7 +14,7 @@
 
 <p align="center">
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-f12c35"></a>
-  <img alt="Version" src="https://img.shields.io/badge/version-1.0.0%20Community-333">
+  <img alt="Version" src="https://img.shields.io/badge/version-1.0.1%20Community-333">
   <img alt="Platform" src="https://img.shields.io/badge/platform-Ubuntu%20%7C%20Debian-333">
   <img alt="Docker" src="https://img.shields.io/badge/runs%20in-Docker-333">
   <img alt="No Elastic" src="https://img.shields.io/badge/Elastic-not%20needed-333">
@@ -146,7 +146,7 @@ severity levels, not technique IDs.
 
 ## Community Edition limits
 
-This repository is **ReD-Pot Community Edition 1.0.0** (MIT). It has these limits:
+This repository is **ReD-Pot Community Edition 1.0.1** (MIT). It has these limits:
 
 | Limit | What it means |
 |---|---|
@@ -156,7 +156,8 @@ This repository is **ReD-Pot Community Edition 1.0.0** (MIT). It has these limit
 | **Fixed bait set** | the set and structure of bait files is fixed and cannot be edited, uploaded or replaced. Passwords, dates and numbers in them are random per installation. |
 | **No outbound alerting** | no Telegram, webhook or e-mail. Alerts go to `alerts.json` on the manager (and the dashboard); use a log shipper for your SIEM, or the JSON export. |
 | **No offline replay** | when a remote sensor cannot reach the manager, events from the outage stay in a local log on the sensor and are never sent later. The manager opens a "possible tampering" incident for the silence and shows how many events were not delivered. |
-| **Fresh installs only** | no in-place upgrade from earlier versions: uninstall, then install 1.0.0. |
+| **Upgrades** | 1.0.0 → 1.0.1 in place with `sudo ./install.sh update` (persona, baits, token, sensors and history kept). From versions before 1.0.0: uninstall, then install. |
+| **Bait documents report through the web UI port** | the bait Word documents call home to the manager's web UI port. Bait documents only report from addresses allowed to reach the console: if you restrict the web UI allow-list (the default when a decoy shares the management address), a bait document opened on any other host is not reported. Bait files, credentials and keys used against the decoys are not affected. A separate beacon endpoint is planned for ReD-Pot Enterprise. |
 | **SMB 2.0.2 and 2.1 only** | the Windows decoys negotiate SMB 2.0.2 and 2.1. SMB 3.x, which current Windows Server versions also offer, is not available yet. A client that lists the supported dialects (for example `nmap --script smb-protocols`) sees the difference. SMB 3.x is planned for ReD-Pot Enterprise. |
 | **Host TCP/IP stack** | decoys use the network stack of the Linux host they run on. Active OS fingerprinting (`nmap -O`) therefore reports Linux, also for a Windows persona. A Windows-like stack profile is planned for ReD-Pot Enterprise. |
 
@@ -180,9 +181,9 @@ Full details and network planning: **[docs/INSTALL.md](docs/INSTALL.md#1-what-yo
 
 ## Quick start
 
-> **Upgrading from v0.3.x or v0.4.x?** Community Edition 1.0.0 supports **fresh installs only**: run
-> `sudo ./install.sh uninstall` with the old version, then install 1.0.0 (new persona, baits and admin token; remote
-> sensors join again).
+> **Upgrading from 1.0.0?** `git pull`, then `sudo ./install.sh update` on the manager and on every remote sensor:
+> persona, baits, admin token, enrolled sensors and the database are kept (backup first, automatic rollback). From
+> v0.3.x / v0.4.x: `sudo ./install.sh uninstall` with the old version, then install 1.0.1.
 
 ```bash
 git clone https://github.com/RedSideSecurity/ReD-Pot.git
@@ -214,6 +215,10 @@ link too). The old token and every logged-in browser stop working immediately.
 **Added a network card?** `sudo ./install.sh add-decoy` puts one more decoy on a free interface (on that interface's own
 address) and keeps the persona, the planted baits and the running decoys; `sudo ./install.sh remove-decoy NAME` takes one
 away again and frees its slot.
+
+**A remote sensor changed its address, or the admin network moved?** Give sensors a static address or a DHCP
+reservation: the manager's sensor-API allow-list does not follow a new DHCP lease. To change the web UI, sensor API or
+host SSH allow-list later: `sudo ./install.sh set-access` (unattended: `--yes --allow-sensor 192.168.1.0/24`).
 
 **Need the data elsewhere?** *Incidents → Export JSON* in the dashboard, or on the manager
 `sudo ./install.sh export --from 2026-11-01 --to 2026-11-13`: the incidents and alert records of those UTC days (at most

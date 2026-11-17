@@ -22,6 +22,7 @@ from rpot import VERSION
 from rpot.common.config import load_config
 from rpot.common.edition import EDITION, MAX_DECOYS, LimitError, limit_message
 from rpot.common.events import now_iso
+from rpot.common.iputil import ip_obj, norm_ip
 from rpot.console import export as X
 from rpot.console.engine import Engine, iso
 from rpot.console.fleet import Fleet
@@ -85,6 +86,20 @@ def create_app(cfg, db_path, geo_dir=None, log_dir=None):
 
     server_hdr = server_header(cfg)
 
+    # re-review R2-L4: X-Forwarded-For is honoured only from these peers (console.trusted_proxies, CIDRs). Empty (the
+    # default) = never, even with console.trust_xff on: a client that reaches the console directly could otherwise
+    # name any address (e.g. an allow-listed one) as the source of a bait beacon.
+    trusted_proxies = []
+    for c in cfg["console"].get("trusted_proxies") or []:
+        try:
+            trusted_proxies.append(ipaddress.ip_network(str(c).strip(), strict=False))
+        except ValueError:
+            print(f"[ReD-Pot manager] console.trusted_proxies: ignoring invalid entry {c!r}", flush=True)
+
+    def from_trusted_proxy(peer):
+        a = ip_obj(peer)
+        return a is not None and any(a in n for n in trusted_proxies)
+
     eng = Engine(cfg, db_path, geo_dir=geo_dir, log_dir=log_dir)
     app.engine = eng
     n_local = len(cfg.get("sensors", []))
@@ -105,9 +120,8 @@ def create_app(cfg, db_path, geo_dir=None, log_dir=None):
     def wall_ip_ok(ip):
         if not wall_allow:
             return True
-        try:
-            a = ipaddress.ip_address(ip)
-        except ValueError:
+        a = ip_obj(ip)                 # IPv4-mapped IPv6 peers match IPv4 entries
+        if a is None:
             return False
         return any(a in n for n in wall_allow)
 
@@ -150,9 +164,8 @@ def create_app(cfg, db_path, geo_dir=None, log_dir=None):
         """Decoys share the internal mgmt network with the manager: they may use the sensor API,
         never the UI port (a hijacked decoy must not even see the login page)."""
         if deny and request.remote_addr:
-            try:
-                a = ipaddress.ip_address(request.remote_addr)
-            except ValueError:
+            a = ip_obj(request.remote_addr)     # ::ffff:<decoy> must be denied like <decoy>
+            if a is None:
                 return
             if any(a in n for n in deny):
                 abort(403)
@@ -200,17 +213,21 @@ def create_app(cfg, db_path, geo_dir=None, log_dir=None):
         tid = tok.split(".")[0]
         t = eng.fleet.all_tokens().get(tid)
         if t and t.get("kind") == "document" and not throttled("c:" + (request.remote_addr or "?"), 30, 600, count=True):
-            src = request.remote_addr
-            if cfg["console"].get("trust_xff") and request.headers.get("X-Forwarded-For"):
-                cand = request.headers["X-Forwarded-For"].split(",")[0].strip()
-                try:
-                    src = str(ipaddress.ip_address(cand))
-                except ValueError:
-                    pass
+            src = norm_ip(request.remote_addr)
+            data = {"token": tid, "desc": t["desc"], "planted": t["planted"],
+                    "ua": (request.headers.get("User-Agent") or "")[:200]}
+            xff = ",".join(request.headers.getlist("X-Forwarded-For"))
+            via_proxy = False
+            if cfg["console"].get("trust_xff") and xff.strip() and from_trusted_proxy(request.remote_addr):
+                # security review L5: the RIGHTMOST entry is the one the trusted proxy added; everything left of it
+                # is client-supplied (a client could name an allow-listed address there and mute the bait alert)
+                cand = xff.split(",")[-1].strip()
+                if ip_obj(cand) is not None:
+                    src, via_proxy = str(ip_obj(cand)), True
+                    data["via_proxy"] = norm_ip(request.remote_addr)
             eng.ingest([{"ts": now_iso(), "sensor": "CANARY", "role": "canary", "sensor_ip": None, "src_ip": src,
                          "src_port": None, "dst_port": None, "proto": "http", "type": "canary.hit", "session": None,
-                         "data": {"token": tid, "desc": t["desc"], "planted": t["planted"],
-                                  "ua": (request.headers.get("User-Agent") or "")[:200]}}])
+                         "data": data, "src_via_proxy": via_proxy}])
         r = make_response(PIXEL)
         r.headers["Content-Type"] = "image/png"
         return r
@@ -313,16 +330,26 @@ def create_app(cfg, db_path, geo_dir=None, log_dir=None):
             d["sensors_offline"] = len(d.get("sensors_offline") or [])
         return jsonify(d)
 
+    MAP_HOURS = (0.25, 1, 24, 168, 720, 24 * 90)   # the UI's range presets (+ the 90-day API maximum)
+
+    def map_hours():
+        """Final review R3-L3: the map APIs are cached per parameter set, so `hours` is rounded UP to a preset: a client
+        cannot fill the cache (or the single-flight lock map) with thousands of distinct values."""
+        h = num("hours", 24, 0.25, 24 * 90)
+        return next(p for p in MAP_HOURS if p >= h)
+
     @app.get("/api/graph")
     def api_graph():
         need_ui()
-        return jsonify(eng.graph(num("hours", 24, 0.25, 24 * 90), int(num("min_level", 1, 0, 5)),
-                                 "all" if request.args.get("scope") == "all" else "internal"))
+        args = (map_hours(), int(num("min_level", 1, 0, 5)),
+                "all" if request.args.get("scope") == "all" else "internal")
+        return jsonify(eng.memo(("graph",) + args, lambda: eng.graph(*args)))
 
     @app.get("/api/worldmap")
     def api_worldmap():
         need_ui(wall=True)
-        d = eng.worldmap(num("hours", 24, 0.25, 24 * 90), int(num("min_level", 1, 0, 5)))
+        args = (map_hours(), int(num("min_level", 1, 0, 5)))
+        d = eng.memo(("worldmap",) + args, lambda: eng.worldmap(*args))
         if ui_role() != "admin":                 # kiosk wall: decoy names + positions, never their addresses
             d["sensors"] = [{k: v for k, v in x.items() if k not in ("ip", "geo_ip")} for x in d.get("sensors") or []]
         return jsonify(d)
@@ -565,7 +592,7 @@ def create_sensor_app(eng):
             return jsonify(error="bad request"), 400
         raw = b.get("info") if isinstance(b.get("info"), dict) else {}
         info = {str(k)[:40]: str(v)[:200] for k, v in list(raw.items())[:20]}
-        info["source_ip"] = ip
+        info["source_ip"] = norm_ip(ip)          # ::ffff:a.b.c.d → a.b.c.d (dual-stack listener)
         try:
             res = eng.fleet.redeem(b.get("token", "")[:200], info)
         except LimitError as e:          # only reached with a VALID token; the token stays unused

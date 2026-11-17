@@ -21,6 +21,25 @@ from http.server import BaseHTTPRequestHandler
 from rpot.common.tlsutil import PinnedClient
 
 ALLOWED = {("POST", "/api/ingest"), ("GET", "/api/config")}
+NOTE_EVERY = 60.0      # s: at most one "manager unreachable" line per minute (QA Q3: no traceback floods)
+
+
+class Notes:
+    """One log line per problem kind and NOTE_EVERY seconds, with the count of the ones not printed."""
+
+    def __init__(self, every=NOTE_EVERY, clock=time.monotonic, out=None):
+        self.every, self.clock, self.out, self.last, self.skipped = every, clock, out, {}, {}
+
+    def __call__(self, kind, text):
+        now = self.clock()
+        if kind in self.last and now - self.last[kind] < self.every:
+            self.skipped[kind] = self.skipped.get(kind, 0) + 1
+            return False
+        n = self.skipped.pop(kind, 0)
+        self.last[kind] = now
+        print(f"[ReD-Pot relay] {text}" + (f" ({n} more since the last note)" if n else ""),
+              file=self.out or sys.stdout, flush=True)
+        return True
 
 
 class UnixHTTPConnection(http.client.HTTPConnection):
@@ -55,8 +74,9 @@ class UnixClient:
             c.close()
 
 
-def serve(sock_path, url, fingerprint):
+def serve(sock_path, url, fingerprint, notes=None):
     upstream = PinnedClient(url, fingerprint, timeout=15)
+    note = notes or Notes()
 
     class H(BaseHTTPRequestHandler):
         def log_message(self, *a):
@@ -71,6 +91,7 @@ def serve(sock_path, url, fingerprint):
             try:
                 status, res = upstream.request(self.command, self.path, body)
             except Exception as e:
+                note("upstream", f"manager unreachable: {type(e).__name__}: {e}"[:200])
                 return self._send(502, {"error": f"{type(e).__name__}: {e}"[:200]})
             self._send(status, res)
 
@@ -81,11 +102,19 @@ def serve(sock_path, url, fingerprint):
             self.send_response(code)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(b)))
-            self.end_headers()
-            self.wfile.write(b)
+            try:
+                self.end_headers()
+                self.wfile.write(b)
+            except (BrokenPipeError, ConnectionResetError):
+                # the sensor gave up waiting (its timeout is shorter than the upstream one): nothing to answer
+                note("client", "the sensor closed the connection before the answer (manager slow or unreachable)")
 
     class S(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
         daemon_threads = True
+
+        def handle_error(self, request, client_address):      # QA Q3: one line, never a traceback
+            e = sys.exc_info()[1]
+            note("handler", f"request failed: {type(e).__name__}: {e}"[:200])
 
     if os.path.exists(sock_path):
         os.remove(sock_path)
